@@ -1,0 +1,34 @@
+*.pyc
+*.mp4
+*.DS_store
+.idea/
+build/
+dist/
+release/
+download/
+MakeEXE.bat
+desktop.ini
+site.csv
+site.csv
+main.spec
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+uv.lock
+.site_smalltool/
+.alos-watch/
+.uav-watcher/
+
+# local maintenance guide (machine-specific paths — auto-loads locally, don't publish)
+CLAUDE.md
+# local tooling / runtime junk
+.claude/
+.wrangler/
+*.log
+crash_log.txt
+.venv/
+kurulum_log.txt
+.build/
+dist/
