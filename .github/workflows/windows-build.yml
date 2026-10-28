@@ -143,8 +143,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$env:GITHUB_REF_NAME" `
-            "dist\Siphon.exe" `
-            "dist\Siphon_SHA256SUMS.txt" `
-            --title "Siphon $env:GITHUB_REF_NAME" `
-            --generate-notes
+          $tag = $env:GITHUB_REF_NAME
+          $assets = @("dist\Siphon.exe", "dist\Siphon_SHA256SUMS.txt")
+          # The release may already exist when the tag was made on the website.
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --title "Siphon $tag" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw "publishing the release failed" }
