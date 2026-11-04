@@ -1,0 +1,1247 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import platform
+import html
+import os
+import re
+import threading
+import requests
+from siphon.core.ssl import SharedSSLAdapter, get_shared_ssl_context
+try:
+    from curl_cffi import requests as _cffi_requests
+    _use_cffi = True
+except Exception:
+    _use_cffi = False
+import urllib.request
+import m3u8
+from siphon.core import config
+from siphon.core.storage import (StorageWriteError, hide_while_working,
+                                 show_when_finished, storage_open)
+from Crypto.Cipher import AES
+from siphon.core.config import headers
+import concurrent.futures
+import copy
+import time
+import subprocess
+import shutil
+import tempfile
+import ctypes
+import sys
+from urllib.parse import urlsplit, urlunsplit, urljoin
+
+
+class MirrorsBlockedError(Exception):
+    pass
+
+
+class DownloadIncompleteError(Exception):
+    """A resumable segment download stopped with a few chunks outstanding."""
+
+    def __init__(self, remaining_segments):
+        try:
+            remaining = max(1, int(remaining_segments))
+        except (TypeError, ValueError):
+            remaining = 1
+        self.remaining_segments = remaining
+        super().__init__(
+            f"download incomplete ({remaining} segment(s) still unavailable; "
+            "Retry resumes existing segments)")
+
+
+request_headers = {'browser': 'firefox', 'platform': platform.system().lower()}
+default_max_workers = config.DEFAULT_MAX_WORKERS_PER_VIDEO
+
+_WINDOWS_FILENAME_TRANSLATION = str.maketrans({
+    '<': '＜', '>': '＞', ':': '：', '"': '＂',
+    '/': '／', '\\': '＼', '|': '｜', '?': '？', '*': '＊',
+})
+_WINDOWS_RESERVED_NAMES = {
+    'CON', 'PRN', 'AUX', 'NUL',
+    *(f'COM{i}' for i in range(1, 10)),
+    *(f'LPT{i}' for i in range(1, 10)),
+}
+
+
+def _sanitize_filename(value):
+    """Keep the source title readable while making it portable to Windows."""
+    name = html.unescape(str(value or ''))
+    name = re.sub(r'[\x00-\x1f\x7f]', ' ', name)
+    name = name.translate(_WINDOWS_FILENAME_TRANSLATION).strip()
+
+    trailing_dots = len(name) - len(name.rstrip('.'))
+    if trailing_dots:
+        name = name[:-trailing_dots] + '．' * trailing_dots
+
+    stem = name.split('.', 1)[0].upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        name = '_' + name
+    return name
+
+
+def _apply_filename_mode(value, mode):
+    """Kept only so an old caller does not break; it no longer cuts anything.
+
+    This used to keep everything before the first space, as a way of pulling
+    a Japanese studio code out of a title.  On any other title it threw the
+    name away — "Rainy Window Jazz" became "Rainy" — and the setting that
+    turned it on is gone.  The filename template does the same job without
+    guessing where a name ends.
+    """
+    return str(value or '').strip()
+
+
+def _apply_filename_template(value, dirname, url, template):
+    """Render the allowlisted filename template without permitting paths."""
+    normalized = config.normalize_filename_template(template)
+    title = _sanitize_filename(value)
+    first = title.split(maxsplit=1)[0] if title else ''
+    code = first if re.search(r'\d', first) else str(dirname or first)
+    host = (urlsplit(str(url or '')).hostname or '').lower()
+    # The name the user gave this site when they added it, else its host.
+    from siphon.core import config as _config
+    site = _config.custom_site_name(host) or host
+    rendered = normalized.format(title=title, code=code, site=site)
+    return _sanitize_filename(re.sub(r'\s+', ' ', rendered).strip())
+
+
+def _utf16_units(value):
+    return len(value.encode('utf-16-le')) // 2
+
+
+def _portable_filename_fits(dest_folder, target_name):
+    part_name = target_name + '.mp4.part'
+    full_path = os.path.join(dest_folder, part_name)
+    return (_utf16_units(full_path) <= 255 and
+            len(part_name.encode('utf-8')) <= 255)
+
+
+def _truncate_target_name(name, dest_folder, dirname):
+    """Cap both Windows path units and POSIX component bytes, keeping a UID."""
+    if _portable_filename_fits(dest_folder, name):
+        return name
+
+    uid = re.sub(r'[^\w]', '', dirname)[-8:] or 'video'
+    suffix = '_' + uid
+    if not _portable_filename_fits(dest_folder, suffix):
+        raise OSError('Destination path is too long for a portable filename')
+
+    best = suffix
+    low, high = 0, len(name)
+    while low <= high:
+        middle = (low + high) // 2
+        prefix = name[:middle].rstrip()
+        candidate = prefix + suffix if prefix else suffix
+        if _portable_filename_fits(dest_folder, candidate):
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+_session_lock = threading.Lock()
+_session = None
+get_shared_ssl_context()
+
+_active_host = {}                 # sticky per-process working host per site_key
+_active_host_lock = threading.Lock()
+
+def _swap_host(url, host):
+    p = urlsplit(url)
+    return urlunsplit((p.scheme or 'https', host, p.path, p.query, p.fragment))
+
+def _is_cf_interstitial(resp):
+    # Fast reject for Cloudflare block pages. NOTE: 'challenge-platform' also appears on
+    # SUCCESSFUL pages on some sites -- never use it as a marker. Content success is decided by validate().
+    if resp.status_code in (403, 429, 503):
+        return True
+    if 'challenge' in resp.headers.get('cf-mitigated', '').lower():
+        return True
+    head = resp.content[:3000].lower()
+    return (b'just a moment' in head) or (b'cf-browser-verification' in head) or (b'cf_chl_' in head)
+
+# Why the last fetch_with_mirrors() call failed per site: 'cloudflare' or
+# 'unreachable' (DNS/ISP block, timeouts).  Read by the GUI for its message.
+last_mirror_failure = {}
+
+_ISP_BLOCK_MARKERS = ('localhost.localdomain', 'Could not resolve host',
+                      'Failed to connect', 'Connection timed out',
+                      'certificate subject name', 'Connection refused')
+
+
+def is_unreachable_error(text):
+    text = str(text or '')
+    return any(marker in text for marker in _ISP_BLOCK_MARKERS)
+
+
+def fetch_with_mirrors(scraper, url, site_key, validate, timeout=12, headers_factory=None):
+    """GET url, rotating host across config.MIRRORS[site_key].
+    Order: original host (if allowlisted) -> sticky active host -> remaining mirrors (dedup, order-preserving).
+    Per host: 1 retry on transport error; skip CF interstitials; reject redirects that land off the allowlist.
+    HTTP 429 on a site listed in config.RATE_LIMIT_WAITS is waited out and retried on the same host.
+    validate(resp)->bool gates content success. headers_factory(host)->dict gives per-host headers (e.g. Referer).
+    Returns (resp, host, reason): 'ok' (validated) | 'empty' (a real non-interstitial page was seen but none validated)
+    | 'blocked' (every attempt was interstitial / transport failure)."""
+    mirrors = config.MIRRORS.get(site_key) or [urlsplit(url).netloc]
+    saw_cloudflare = False
+    orig = urlsplit(url).netloc
+    with _active_host_lock:
+        active = _active_host.get(site_key)
+    order = []
+    for h in [orig, active] + list(mirrors):
+        if h and h in mirrors and h not in order:
+            order.append(h)
+    if not order:
+        order = list(mirrors)
+    saw_real = False
+    for host in order:
+        target = _swap_host(url, host)
+        base_hdrs = dict(headers_factory(host) or {}) if headers_factory else {}
+        ov = config.get_cf_override(host)
+        trials = []
+        if ov:
+            h2 = dict(base_hdrs)
+            if ov.get('ua'):
+                h2['User-Agent'] = ov['ua']
+            ck = {'cf_clearance': ov['cookie']} if ov.get('cookie') else None
+            trials.append((h2, ck))
+        trials.append((base_hdrs, None))
+        resp = None
+        rate_limit_waits = list(config.RATE_LIMIT_WAITS.get(site_key, ()))
+        for hdrs, cookies in trials:
+            r = None
+            transport_failures = 0
+            while transport_failures < 2:             # 1 retry on transport error
+                try:
+                    r = scraper.get(
+                        target, timeout=timeout, headers=hdrs or {}, cookies=cookies,
+                        **config.proxy_request_kwargs())
+                except Exception as exc:
+                    r = None
+                    transport_failures += 1
+                    print(f'[mirror] {host}: connection failed ({str(exc)[:160]})',
+                          flush=True)
+                    if is_unreachable_error(exc):
+                        transport_failures = 2   # blocked/unreachable: retrying won't help
+                    continue
+                if r.status_code == 429 and rate_limit_waits:
+                    time.sleep(rate_limit_waits.pop(0))   # rate limited: wait, then same host again
+                    continue
+                break
+            if r is None:
+                continue
+            if _is_cf_interstitial(r):
+                resp = r
+                continue
+            resp = r
+            break
+        if resp is None:
+            continue
+        if _is_cf_interstitial(resp):
+            saw_cloudflare = True
+            print(f'[mirror] {host}: Cloudflare check page / blocked '
+                  f'(HTTP {resp.status_code})', flush=True)
+            continue
+        try:
+            final_host = urlsplit(str(resp.url)).netloc
+        except Exception:
+            final_host = host
+        if final_host and final_host not in mirrors:  # redirected off the allowlist -> distrust
+            print(f'[mirror] {host}: redirected to unknown host {final_host}', flush=True)
+            continue
+        saw_real = True
+        try:
+            ok = validate(resp)
+        except Exception:
+            ok = False
+        if ok:
+            with _active_host_lock:
+                _active_host[site_key] = host
+            return resp, host, 'ok'
+        print(f'[mirror] {host}: HTTP {resp.status_code}, page has no video list '
+              f'(final URL {resp.url})', flush=True)
+    if not saw_real:
+        last_mirror_failure[site_key] = 'cloudflare' if saw_cloudflare else 'unreachable'
+    return None, None, ('empty' if saw_real else 'blocked')
+
+# ── Global speed limiter (token bucket) ──────────────────────────
+class _SpeedLimiter:
+    """Thread-safe token-bucket rate limiter shared across all downloads."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._limit_bps = 0  # 0 = unlimited
+        self._tokens = 0.0
+        self._last = time.time()
+
+    @property
+    def limit_bps(self) -> int:
+        """Current global cap in bytes/s, or 0 when unlimited."""
+        with self._lock:
+            return self._limit_bps
+
+    def set_limit(self, mbps: float) -> None:
+        with self._lock:
+            self._limit_bps = int(mbps * 1024 * 1024) if mbps > 0 else 0
+            # Start empty so a new/changed limit takes effect at once
+            # instead of first letting a full second's worth through.
+            self._tokens = 0.0
+            self._last = time.time()
+
+    def _burst(self) -> float:
+        # Allow at most a quarter second of burst (min 16 KB) so the rate
+        # stays even instead of alternating between bursts and pauses.
+        return max(self._limit_bps * 0.25, 16384.0)
+
+    def acquire(self, nbytes: int) -> None:
+        with self._lock:
+            limit = self._limit_bps
+        if limit <= 0:
+            return
+        while nbytes > 0:
+            with self._lock:
+                now = time.time()
+                self._tokens += (now - self._last) * self._limit_bps
+                self._last = now
+                if self._tokens > self._burst():
+                    self._tokens = self._burst()
+                take = min(nbytes, int(self._tokens))
+                if take > 0:
+                    self._tokens -= take
+                    nbytes -= take
+            if nbytes > 0:
+                time.sleep(0.05)
+
+speed_limiter = _SpeedLimiter()
+
+
+def _is_valid_ts_segment(data):
+    if not data or len(data) < 188:
+        return False
+    if data[:1] == b'\x47':
+        return True
+    # Some servers put an ID3 tag (HLS timed metadata) or a few junk bytes
+    # in front of the MPEG-TS packets; accept the segment when a run of TS
+    # sync bytes starts within the first 4 KB.
+    limit = min(len(data) - 188 * 2, 4096)
+    for offset in range(1, max(limit, 0)):
+        if (data[offset] == 0x47 and data[offset + 188] == 0x47
+                and data[offset + 376] == 0x47):
+            return True
+    return False
+
+_FFMPEG_PATH = None
+_FFMPEG_RESOLVED = False
+
+def _no_window_kwargs():
+    if os.name == 'nt':
+        return {'creationflags': 0x08000000}  # CREATE_NO_WINDOW
+    return {}
+
+def _ffmpeg_works(path):
+    try:
+        r = subprocess.run([path, '-version'], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10, **_no_window_kwargs())
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def _companion_ffmpeg():
+    """Look for ffmpeg shipped next to the app (frozen exe folder / _MEIPASS / script dir)."""
+    dirs = []
+    if getattr(sys, 'frozen', False):
+        dirs.append(os.path.dirname(sys.executable))
+        mp = getattr(sys, '_MEIPASS', None)
+        if mp:
+            dirs.append(mp)
+    else:
+        dirs.append(os.path.dirname(os.path.abspath(__file__)))
+        dirs.append(os.getcwd())
+    names = ('ffmpeg.exe', 'ffmpeg') if os.name == 'nt' else ('ffmpeg',)
+    for d in dirs:
+        for nm in names:
+            p = os.path.join(d, nm)
+            if os.path.isfile(p):
+                return p
+    return None
+
+def locate_ffmpeg():
+    global _FFMPEG_PATH, _FFMPEG_RESOLVED
+    if _FFMPEG_RESOLVED:
+        return _FFMPEG_PATH
+    def candidates():
+        c = _companion_ffmpeg()
+        if c:
+            yield c
+        w = shutil.which('ffmpeg')
+        if w:
+            yield w
+        try:
+            import imageio_ffmpeg
+            yield imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            return
+    chosen = None
+    for c in candidates():
+        if c and _ffmpeg_works(c):
+            chosen = c
+            break
+    _FFMPEG_PATH = chosen
+    _FFMPEG_RESOLVED = True
+    return chosen
+
+def _ffmpeg_safe_dir(path):
+    """Return an ffmpeg-friendly (ASCII if possible) form of an EXISTING dir path."""
+    if os.name != 'nt' or path.isascii():
+        return path
+    try:
+        GetShort = ctypes.windll.kernel32.GetShortPathNameW
+        buf = ctypes.create_unicode_buffer(600)
+        n = GetShort(path, buf, 600)
+        if n and n < 600 and buf.value:
+            return buf.value
+    except Exception:
+        pass
+    return path
+
+# ── Resolution preference ──────────────────────────────────────────
+_VALID_RESOLUTION_PREFS = {'highest', 'lowest', '1080', '720', '480', '360'}
+_resolution_pref = 'highest'
+
+
+def set_resolution_pref(value) -> None:
+    global _resolution_pref
+    pref = str(value or '').strip().lower()
+    if pref in _VALID_RESOLUTION_PREFS:
+        _resolution_pref = pref
+
+
+def get_resolution_pref() -> str:
+    return _resolution_pref
+
+
+def set_prefer_lowest_res(value: bool) -> None:
+    set_resolution_pref('lowest' if value else 'highest')
+
+
+def get_prefer_lowest_res() -> bool:
+    return _resolution_pref == 'lowest'
+
+
+def _variant_height_bw(playlist):
+    stream_info = getattr(playlist, 'stream_info', None)
+    height = None
+    resolution = getattr(stream_info, 'resolution', None) if stream_info else None
+    if isinstance(resolution, (tuple, list)) and len(resolution) == 2:
+        try:
+            height = int(resolution[1])
+        except (TypeError, ValueError):
+            height = None
+    try:
+        bandwidth = int(getattr(stream_info, 'bandwidth', 0) or 0) if stream_info else 0
+    except (TypeError, ValueError):
+        bandwidth = 0
+    return height, bandwidth
+
+
+def select_variant(playlists, pref):
+    items = [(playlist, *_variant_height_bw(playlist)) for playlist in (playlists or [])]
+    if not items:
+        return None
+
+    pref = str(pref or '').strip().lower()
+    if pref not in _VALID_RESOLUTION_PREFS:
+        pref = 'highest'
+
+    known = [item for item in items if item[1] is not None]
+    if pref == 'lowest':
+        if known:
+            return min(known, key=lambda item: (item[1], item[2]))[0]
+        return min(items, key=lambda item: item[2])[0]
+
+    if pref in {'1080', '720', '480', '360'}:
+        if not known:
+            return max(items, key=lambda item: item[2])[0]
+        target = int(pref)
+        at_or_below = [item for item in known if item[1] <= target]
+        if at_or_below:
+            return max(at_or_below, key=lambda item: (item[1], item[2]))[0]
+        return min(known, key=lambda item: (item[1], -item[2]))[0]
+
+    if known:
+        return max(known, key=lambda item: (item[1], item[2]))[0]
+    return max(items, key=lambda item: item[2])[0]
+
+
+def _get_session():
+    global _session
+    if _session is None:
+        with _session_lock:
+            if _session is None:
+                _session = requests.Session()
+                http_adapter = requests.adapters.HTTPAdapter(
+                    pool_connections=32,
+                    pool_maxsize=64,
+                    max_retries=2,
+                )
+                https_adapter = SharedSSLAdapter(
+                    pool_connections=32,
+                    pool_maxsize=64,
+                    max_retries=2,
+                )
+                _session.mount('http://', http_adapter)
+                _session.mount('https://', https_adapter)
+    return _session
+
+
+_cffi_tls = threading.local()
+_CDN_BLOCKED_MSG = "Video CDN is blocked by Cloudflare; try a VPN/WARP or another network"
+
+
+def _get_cffi_session():
+    session = getattr(_cffi_tls, 'session', None)
+    if session is None:
+        session = _cffi_requests.Session(impersonate='chrome')
+        _cffi_tls.session = session
+    return session
+
+
+def _is_cf_block_resp(resp):
+    try:
+        if getattr(resp, 'status_code', None) not in (403, 429, 503):
+            return False
+        resp_headers = getattr(resp, 'headers', {}) or {}
+        server = resp_headers.get('Server', resp_headers.get('server', '')) if hasattr(resp_headers, 'get') else ''
+        has_cf_ray = any(str(k).lower() == 'cf-ray' for k in resp_headers.keys())
+        content = getattr(resp, 'content', b'') or b''
+        head = content[:3000]
+        if isinstance(head, str):
+            head = head.encode('utf-8', errors='ignore')
+        head = head.lower()
+        return (
+            'cloudflare' in str(server).lower()
+            or has_cf_ray
+            or any(marker in head for marker in (
+                b'attention required',
+                b'just a moment',
+                b'cf_chl_',
+                b'cf-error',
+            ))
+        )
+    except Exception:
+        return False
+
+
+def _http_get(url, headers=None, timeout=20):
+    if _use_cffi:
+        try:
+            cffi_headers = {
+                k: v for k, v in dict(headers or {}).items()
+                if str(k).lower() != 'user-agent'
+            }
+            return _get_cffi_session().get(
+                url, headers=cffi_headers, timeout=timeout,
+                **config.proxy_request_kwargs())
+        except Exception:
+            pass
+    return _get_session().get(
+        url, headers=dict(headers or {}), timeout=timeout,
+        **config.proxy_request_kwargs())
+
+
+class M3U8Crawler:
+    """A base class for all m3u8 crawl website tools."""
+    skip_pattern = False
+    segment_worker_cap = None
+    segment_retry_rounds = 6
+    segment_retry_base_delay = 1.5
+    segment_retry_max_delay = 6.0
+
+    @classmethod
+    def validate_url(cls, url):
+        if not url or url == '': return None
+        result = re.match(cls.website_dirname_pattern, url, flags=re.I)
+        if result: return result.group(1)
+        return None
+
+    def __init__(
+            self, url, savepath="", silence=False, max_workers=None,
+            resolution=None, filename_template=None):
+        self.silence = silence
+        self._tsList = []
+        self._key_content = None   # raw bytes of AES key
+        self._key_method = None    # e.g. 'AES-128'
+        self._key_iv = None        # hex IV string (may be None)
+        self._downloadList = []
+        self._t_executor = None
+        self._t_future = None
+        self._t2_executor = None
+        self._cancel_job = None
+        self._ffmpeg_proc = None
+        self._extra_headers = {}   # subclass may set (e.g. Referer)
+        self._dirName = None
+        self._dest_folder = None
+        self._temp_folder = None
+        self._targetName = None
+        self._imageUrl = None
+        self._m3u8url = None
+        if max_workers is None:
+            # Per-site value from Settings (falls back to the global default).
+            max_workers = config.get_max_workers_for_site(
+                config.site_key_for_url(url))
+        normalized_workers = config.normalize_max_workers_per_video(max_workers)
+        worker_cap = getattr(self, 'segment_worker_cap', None)
+        if worker_cap is not None:
+            try:
+                normalized_workers = min(
+                    normalized_workers, max(1, int(worker_cap)))
+            except (TypeError, ValueError):
+                pass
+        self._max_workers = normalized_workers
+        self._segment_retry_rounds = max(
+            1, int(getattr(self, 'segment_retry_rounds', 6)))
+        self._segment_retry_base_delay = max(
+            0.0, float(getattr(self, 'segment_retry_base_delay', 1.5)))
+        self._segment_retry_max_delay = max(
+            self._segment_retry_base_delay,
+            float(getattr(self, 'segment_retry_max_delay', 6.0)))
+        self._filename_template = config.normalize_filename_template(
+            filename_template if filename_template is not None
+            else config.get_filename_template())
+        requested_resolution = str(
+            resolution or get_resolution_pref()).strip().lower()
+        self._resolution_pref = (
+            requested_resolution
+            if requested_resolution in _VALID_RESOLUTION_PREFS
+            else 'highest')
+        self._progress_callback = None   # (downloaded, total, speed_bps) -> None
+        self._speed_lock = threading.Lock()
+        self._bytes_downloaded = 0
+        self._speed_start = 0.0
+        self._last_error = None
+        try:
+            self._dirName = self.validate_url(url)
+            if not self._dirName: return
+            self._url = url
+            if (savepath is None) or (savepath == ''):
+                self._dest_folder = os.path.join(os.getcwd(), self._dirName)
+            else:
+                self._dest_folder = os.path.abspath(savepath)
+            self._temp_folder = os.path.join(self._dest_folder, self._dirName)
+
+            self.get_url_infos()
+            if self.is_url_vaildate():
+                if self._targetName:
+                    self._targetName = _sanitize_filename(self._targetName)
+                    if self._filename_template != config.DEFAULT_FILENAME_TEMPLATE:
+                        self._targetName = _apply_filename_template(
+                            self._targetName, self._dirName, self._url,
+                            self._filename_template)
+                    if len(self._dirName) > 80:
+                        self._dirName = self._dirName[:80]
+                        self._temp_folder = os.path.join(self._dest_folder, self._dirName)
+                    if not self._targetName.strip():
+                        self._targetName = (_sanitize_filename(self._dirName)
+                                            or 'video')
+                    self._targetName = _truncate_target_name(
+                        self._targetName, self._dest_folder, self._dirName)
+                if not self.silence:
+                    if self._targetName: print("File name: " + self._targetName, flush=True)
+                    if self._dest_folder: print("Save location: " + self._dest_folder, flush=True)
+                    if self._imageUrl: print("Thumbnail: " + self._imageUrl, flush=True)
+
+        except Exception as exc:
+            self._last_error = exc
+            self._targetName = self._imageUrl = self._m3u8url = None
+            print(f"Download URL {url} error! ({exc})", flush=True)
+
+    def get_url_infos(self): raise Exception("Must implement get_url_infos()")
+    def target_name(self): return self._targetName
+    def dest_folder(self): return self._dest_folder
+    def is_url_vaildate(self): return True if self._m3u8url else False
+
+    def _transform_segment(self, data):
+        """Hook: transform raw segment bytes before AES/write. Default identity; sites may override."""
+        return data
+
+    def _create_temp_folder(self):
+        if not os.path.exists(self._temp_folder):
+            try:
+                os.makedirs(self._temp_folder, exist_ok=True)
+            except OSError as exc:
+                raise StorageWriteError(self._temp_folder, exc) from exc
+
+    def _create_dest_folder(self):
+        if not os.path.exists(self._dest_folder):
+            try:
+                os.makedirs(self._dest_folder, exist_ok=True)
+            except OSError as exc:
+                raise StorageWriteError(self._dest_folder, exc) from exc
+
+    def _get_video_savename(self):
+        return os.path.join(self._dest_folder, self._targetName + ".mp4")
+
+    def _get_image_savename(self):
+        if self._imageUrl is None: return None
+        return os.path.join(self._dest_folder, self._targetName + ".jpg")
+
+    def get_url_full(self): return self._url
+
+    def is_target_video_exist(self):
+        return os.path.exists(self._get_video_savename())
+
+    def is_target_image_exist(self):
+        if self._imageUrl is None: return True
+        return os.path.exists(self._get_image_savename())
+
+    def _m3u8_headers(self):
+        """Merged headers for m3u8 and segment requests."""
+        return {**headers, **self._extra_headers}
+
+    def _load_m3u8(self, url):
+        resp = _http_get(url, self._m3u8_headers(), timeout=20)
+        status = getattr(resp, 'status_code', 0)
+        if status != 200:
+            if _is_cf_block_resp(resp):
+                raise MirrorsBlockedError(_CDN_BLOCKED_MSG)
+            raise Exception(f"m3u8 request failed (HTTP {status}): {url}")
+        text = resp.text or ''
+        if '#EXTM3U' not in text:
+            content = getattr(resp, 'content', b'') or b''
+            head = content[:3000]
+            if isinstance(head, str):
+                head = head.encode('utf-8', errors='ignore')
+            if _is_cf_block_resp(resp) or b'cloudflare' in head.lower():
+                raise MirrorsBlockedError(_CDN_BLOCKED_MSG)
+            raise Exception(f"m3u8 content invalid (blocked or site changed): {url}")
+        return m3u8.loads(text, uri=str(getattr(resp, 'url', url)))
+
+    def _getm3u8PlayList(self, uri):
+        if uri.startswith(('http://', 'https://', '//')):
+            playListUrl = urljoin(self._m3u8url, uri)
+        else:
+            m3u8urlPath = self._m3u8url.split('/')
+            if uri.startswith('/'): m3u8urlPath = m3u8urlPath[:3]
+            else: m3u8urlPath.pop(-1)
+            baseurl = '/'.join(m3u8urlPath)
+            playListUrl = baseurl + '/' + uri.lstrip('/')
+        m3u8obj = self._load_m3u8(playListUrl)
+        variantBase = playListUrl.rsplit('/', 1)[0] + '/'
+        return m3u8obj, variantBase
+
+    def _create_m3u8(self):
+        m3u8urlList = self._m3u8url.split('/')
+        m3u8urlList.pop(-1)
+        downloadurl = '/'.join(m3u8urlList) + '/'
+
+        m3u8obj = self._load_m3u8(self._m3u8url)
+        if len(m3u8obj.playlists) > 0:
+            # Pick variant based on resolution preference
+            best = select_variant(m3u8obj.playlists, self._resolution_pref)
+            if best:
+                m3u8obj, downloadurl = self._getm3u8PlayList(best.uri)
+
+        # Extract key info (store bytes + IV, not a cipher - cipher is NOT thread-safe)
+        self._key_content = None
+        self._key_method = None
+        self._key_iv = None
+        for key in m3u8obj.keys:
+            if key and key.uri:
+                m3u8_key_uri = key.uri
+                if not m3u8_key_uri.startswith('http'):
+                    m3u8_key_uri = downloadurl + m3u8_key_uri
+                resp = _http_get(m3u8_key_uri, self._m3u8_headers(), timeout=15)
+                blocked = _is_cf_block_resp(resp)
+                if resp.status_code != 200 or blocked:
+                    if blocked:
+                        raise MirrorsBlockedError(_CDN_BLOCKED_MSG)
+                    raise Exception("Could not get AES key")
+                self._key_content = resp.content
+                self._key_method = getattr(key, 'method', 'AES-128')
+                self._key_iv = getattr(key, 'iv', None)
+                break  # use first key
+
+        # Per HLS: a key with no explicit IV uses an implicit IV = the segment's MEDIA
+        # SEQUENCE number, which begins at #EXT-X-MEDIA-SEQUENCE (may be non-zero), not 0.
+        self._media_sequence = getattr(m3u8obj, 'media_sequence', 0) or 0
+        # Build segment URL list
+        self._tsList = []
+        for seg in m3u8obj.segments:
+            uri = seg.uri
+            if uri.startswith('https://') or uri.startswith('http://'):
+                tsUrl = uri
+            else:
+                tsUrl = downloadurl + uri
+            self._tsList.append(tsUrl)
+        if not self._tsList:
+            raise Exception("m3u8 has no valid segments (blocked or site changed)")
+
+    def _make_cipher(self, seq_num=0):
+        """Create a fresh AES cipher for one segment (thread-safe)."""
+        if not self._key_content:
+            return None
+        if self._key_iv:
+            iv_hex = self._key_iv.replace("0x", "").replace("0X", "")
+            iv_bytes = bytes.fromhex(iv_hex.zfill(32))
+        else:
+            # Default IV = this segment's media-sequence number (base + playlist index),
+            # as a 16-byte big-endian value.
+            iv_bytes = (seq_num + getattr(self, '_media_sequence', 0)).to_bytes(16, 'big')
+        return AES.new(self._key_content, AES.MODE_CBC, iv_bytes)
+
+    def _seg_savename(self, index):
+        """Per-segment temp file named by playlist INDEX, not URL basename. Two segment
+        URLs can share a basename (e.g. seg.ts?n=1 vs seg.ts?n=2, or same-named files in
+        different path dirs); basename naming collided them into one file — the second was
+        skipped as 'already done' and the first was read twice at merge, silently
+        corrupting the output. Index naming is unique and keeps resume correct."""
+        return os.path.join(self._temp_folder, f"{index:06d}.mp4")
+
+    def _deleteMp4Chunks(self):
+        for i in range(len(self._tsList)):
+            saveName = self._seg_savename(i)
+            if os.path.exists(saveName):
+                try: os.remove(saveName)
+                except OSError: pass
+
+    def _cancellable_move(self, src, dst):
+        """Move src->dst honoring cancel. Fast same-volume rename, else chunked copy."""
+        try:
+            os.replace(src, dst)   # same volume: instant + atomic
+            show_when_finished(dst)
+            return True
+        except OSError as exc:
+            import errno
+            if exc.errno != errno.EXDEV:
+                raise StorageWriteError(dst, exc) from exc
+        try:
+            with storage_open(src, 'rb') as fi, storage_open(dst, 'wb') as fo:
+                while True:
+                    if self._cancel_job:
+                        break
+                    buf = fi.read(4 * 1024 * 1024)
+                    if not buf:
+                        try: os.remove(src)
+                        except OSError: pass
+                        return True
+                    fo.write(buf)
+            try: os.remove(dst)      # cancelled mid-copy
+            except OSError: pass
+            return False
+        except StorageWriteError:
+            raise
+        except Exception:
+            return False
+
+    def _mergeMp4Chunks(self):
+        start_time = time.time()
+        saveName = self._get_video_savename()
+        part = saveName + '.part'
+        for p in (saveName, part):
+            if os.path.exists(p):
+                try: os.remove(p)
+                except OSError: pass
+        n = len(self._tsList)
+        print(f'Merging video... total {n} segments', flush=True)
+
+        # Keep the full-size merge and remux copies on the selected download
+        # volume.  Windows' default temp directory normally lives on C:, and
+        # using it here could consume almost two extra copies of a video after
+        # the segment progress had already reached 100%.
+        try:
+            workdir = tempfile.mkdtemp(
+                prefix='siphon-remux-', dir=self._dest_folder)
+        except OSError as exc:
+            raise StorageWriteError(self._dest_folder, exc) from exc
+        merged = os.path.join(workdir, 'merged.ts')
+        out_mp4 = os.path.join(workdir, 'out.mp4')
+        published = False
+        try:
+            remaining = n
+            with storage_open(merged, 'wb') as out:
+                for idx, ts_url in enumerate(self._tsList):
+                    if self._cancel_job:
+                        return 0
+                    seg = self._seg_savename(idx)
+                    if idx in getattr(self, '_skip_segments', ()):
+                        remaining -= 1
+                        continue
+                    if not os.path.exists(seg):
+                        if not self._cancel_job:
+                            print(f"\nSegment {idx} missing, merge failed!!!", flush=True)
+                        return 0
+                    with storage_open(seg, 'rb') as f:
+                        shutil.copyfileobj(f, out, 1024 * 1024)
+                    remaining -= 1
+                    print(f'\rMerging video, remaining {remaining} segments', end="")
+            print()
+            if self._cancel_job:
+                return 0
+
+            ok = self._remux_to_mp4(merged, out_mp4, workdir)
+            if self._cancel_job:
+                return 0
+            if ok:
+                moved = self._cancellable_move(out_mp4, part)
+            else:
+                print('[Merge] ffmpeg unavailable or remux failed; used plain merge (plays fine, seeking may be off in some players)', flush=True)
+                moved = self._cancellable_move(merged, part)
+            if self._cancel_job or not moved:
+                if os.path.exists(part):
+                    try: os.remove(part)
+                    except OSError: pass
+                return 0
+            try:
+                os.replace(part, saveName)
+            except OSError as exc:
+                raise StorageWriteError(saveName, exc) from exc
+            show_when_finished(saveName)
+            published = True
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+            if not published and os.path.exists(part):
+                try: os.remove(part)
+                except OSError: pass
+
+        spent_time = time.time() - start_time
+        print(f'\nMerge finished, took {spent_time:.1f} s', flush=True)
+        self._deleteMp4Chunks()
+        if self._temp_folder != self._dest_folder:
+            try: os.removedirs(self._temp_folder)
+            except OSError: pass
+        return spent_time
+
+    def _remux_to_mp4(self, merged_ts, out_mp4, workdir):
+        ffmpeg = locate_ffmpeg()
+        if not ffmpeg:
+            print('[Merge] ffmpeg not found, skipping remux', flush=True)
+            return False
+        ff_dir = _ffmpeg_safe_dir(workdir)
+        in_arg = os.path.join(ff_dir, os.path.basename(merged_ts))
+        out_arg = os.path.join(ff_dir, os.path.basename(out_mp4))
+        log_path = os.path.join(workdir, 'ffmpeg.log')
+        cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+               '-fflags', '+genpts', '-i', in_arg,
+               '-c', 'copy', '-movflags', '+faststart',
+               '-avoid_negative_ts', 'make_zero', out_arg]
+        print('Remuxing to a seekable MP4 ...', flush=True)
+        try:
+            with storage_open(log_path, 'wb') as errf:
+                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=errf,
+                                        **_no_window_kwargs())
+                self._ffmpeg_proc = proc
+                try:
+                    while True:
+                        try:
+                            proc.wait(timeout=0.3); break
+                        except subprocess.TimeoutExpired:
+                            if self._cancel_job:
+                                proc.kill(); proc.wait(); return False
+                finally:
+                    self._ffmpeg_proc = None
+        except StorageWriteError:
+            raise
+        except Exception as e:
+            print(f'[Merge] ffmpeg error: {e}', flush=True)
+            return False
+        if self._cancel_job:
+            return False
+        try:
+            if proc.returncode == 0 and os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0:
+                return True
+        except OSError as exc:
+            raise StorageWriteError(out_mp4, exc) from exc
+        tail = ''
+        try:
+            with storage_open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                tail = f.read()[-800:]
+        except StorageWriteError:
+            raise
+        except Exception:
+            pass
+        storage_failure = re.search(
+            r'no space left|disk (?:is )?full|input/output error|'
+            r'i/o error|device (?:is )?not ready|no such device|'
+            r'device not connected|error (?:writing|closing)|'
+            r'failed to (?:write|flush)', tail, re.IGNORECASE)
+        if storage_failure:
+            raise StorageWriteError(out_mp4, OSError(tail.strip()))
+        print(f'[Merge] ffmpeg remux failed rc={proc.returncode}: {tail}', flush=True)
+        return False
+
+    # Sites may allow finishing a video when at most this many segments
+    # (and under 1 %) are permanently missing on the server (404/410 or not
+    # video data) after every retry.
+    allow_missing_segments = 0
+    skippable_segment_reasons = ('HTTP 404', 'HTTP 410', 'not a video')
+
+    def _rescue_segments(self):
+        """Last chance for segments that failed every retry (sites override)."""
+        return None
+
+    def _can_skip_missing_segments(self):
+        pending = getattr(self, '_pending_set', set())
+        limit = int(getattr(self, 'allow_missing_segments', 0) or 0)
+        total = len(getattr(self, '_tsList', []) or [])
+        if not pending or not limit or len(pending) > limit or len(pending) * 100 > total:
+            return False
+        reasons = getattr(self, '_seg_fail_logged', {})
+        allowed = tuple(getattr(self, 'skippable_segment_reasons', ()) or ())
+        return all(str(reasons.get(i, '')).startswith(allowed) for i, _ in pending)
+
+    def _note_segment_failure(self, seq_num, url, reason):
+        """Log why a segment failed – once per segment and reason."""
+        seen = self.__dict__.setdefault('_seg_fail_logged', {})
+        if seen.get(seq_num) == reason:
+            return
+        seen[seq_num] = reason
+        total = len(getattr(self, '_tsList', []) or [])
+        print(f'[segment {seq_num + 1}/{total}] {reason}: …{str(url)[-70:]}', flush=True)
+
+    def _scrape(self, task):
+        """Download and decrypt one segment. task=(seq_num, url)"""
+        if self._cancel_job or getattr(self, '_storage_error', None):
+            return False
+        seq_num, url = task
+        saveName = self._seg_savename(seq_num)
+        if os.path.exists(saveName):
+            # Segment already on disk (e.g. from a resumed job) — drop from pending
+            with self._speed_lock:
+                self._pending_set.discard((seq_num, url))
+            return True
+
+        try:
+            response = _http_get(url, self._m3u8_headers(), timeout=25)
+            if response.status_code != 200:
+                self._note_segment_failure(seq_num, url, f'HTTP {response.status_code}')
+                return False
+            content_ts = response.content
+            if not content_ts:
+                self._note_segment_failure(seq_num, url, 'empty reply')
+                return False
+            if self._key_content:
+                cipher = self._make_cipher(seq_num)
+                content_ts = cipher.decrypt(content_ts)
+            # Provider wrappers/TS headers belong to the plaintext stream.
+            # LUC encrypts the whole segment, so stripping its ciphertext
+            # before AES decryption would discard every valid segment.
+            content_ts = self._transform_segment(content_ts)
+            if not _is_valid_ts_segment(content_ts):
+                self._note_segment_failure(
+                    seq_num, url, f'not a video segment ({len(content_ts)} bytes, '
+                    f'starts {content_ts[:8]!r})')
+                return False
+            speed_limiter.acquire(len(content_ts))
+            # Publish only fully written segments. A disk error must not
+            # leave a truncated .ts looking resumable on the next run.
+            part = saveName + '.part'
+            with storage_open(part, 'wb') as f:
+                hide_while_working(part)
+                f.write(content_ts)
+            try:
+                os.replace(part, saveName)
+            except OSError as exc:
+                raise StorageWriteError(saveName, exc) from exc
+            show_when_finished(saveName)
+            with self._speed_lock:
+                self._pending_set.discard((seq_num, url))
+                self._bytes_downloaded += len(content_ts)
+                remain = len(self._pending_set)
+                elapsed = time.time() - self._speed_start
+                speed = self._bytes_downloaded / elapsed if elapsed > 0 else 0
+                done = self._job_total - remain
+                remain_time = (remain * elapsed / done) if done > 0 else 0
+                whole = len(getattr(self, '_tsList', None) or ()) or self._job_total
+                if remain_time > 60:
+                    rem_str = f"{remain_time//60:.0f}m {remain_time%60:.0f}s"
+                else:
+                    rem_str = f"{remain_time:.0f}s"
+                speed_str = f"{speed/1024:.0f} KB/s" if speed < 1024*1024 else f"{speed/1024/1024:.1f} MB/s"
+                print(f'\rDownloading: {done}/{self._job_total} segments | {speed_str} | remaining {rem_str}  ', end='', flush=True)
+                if self._progress_callback:
+                    # Whole-video progress, so a resumed download continues
+                    # from e.g. 74 % instead of starting the bar at 0 %.
+                    self._progress_callback(whole - remain, whole, speed)
+            return True
+        except StorageWriteError as exc:
+            self._storage_error = exc
+            raise
+        except Exception as exc:
+            self._note_segment_failure(seq_num, url, f'error: {str(exc)[:120]}')
+            return False
+
+    def _startCrawl(self):
+        self._storage_error = None
+        self._progress_unit = 'segments'
+        self._speed_start = time.time()
+        self._bytes_downloaded = 0
+        total = len(self._tsList)
+        self._job_total = len(self._pending_set)
+        print(f'total {total} segments, done {total - self._job_total}, remaining {self._job_total}...', flush=True)
+        if getattr(self, '_progress_callback', None) and total:
+            try:
+                self._progress_callback(total - self._job_total, total, 0)
+            except Exception:
+                pass
+
+        max_rounds = max(1, int(getattr(
+            self, '_segment_retry_rounds',
+            getattr(self, 'segment_retry_rounds', 6))))
+        retry_base_delay = max(0.0, float(getattr(
+            self, '_segment_retry_base_delay',
+            getattr(self, 'segment_retry_base_delay', 1.5))))
+        retry_max_delay = max(retry_base_delay, float(getattr(
+            self, '_segment_retry_max_delay',
+            getattr(self, 'segment_retry_max_delay', 6.0))))
+        for round_num in range(1, max_rounds + 1):
+            if not self._pending_set or self._cancel_job:
+                break
+            tasks = list(self._pending_set)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+                self._t2_executor = executor
+                list(executor.map(self._scrape, tasks, timeout=None))
+            self._t2_executor = None
+            still_pending = len(self._pending_set)
+            if still_pending == 0:
+                break
+            if round_num < max_rounds:
+                print(f'\nRetry #{round_num}, remaining {still_pending} segments...', flush=True)
+                if not self._cancel_job:
+                    delay = min(
+                        retry_base_delay * round_num,
+                        retry_max_delay)
+                    if delay > 0:
+                        time.sleep(delay)
+
+        self._t2_executor = None
+        spent = time.time() - self._speed_start
+        if not self._cancel_job:
+            final_pending = len(self._pending_set)
+            if final_pending == 0:
+                print(f'\nCrawl finished! took {spent/60:.1f} min', flush=True)
+            else:
+                print(f'\nCrawl ended, {final_pending} segments failed', flush=True)
+
+    def _prepareCrawl(self):
+        self._pending_set = set()
+        for i, url in enumerate(self._tsList):
+            saveName = self._seg_savename(i)
+            if not os.path.exists(saveName):
+                self._pending_set.add((i, url))
+        if self._pending_set:
+            self._startCrawl()
+
+    def download_image(self):
+        if not self.is_target_image_exist():
+            self._create_dest_folder()
+            try:
+                response = _http_get(self._imageUrl, self._m3u8_headers(), timeout=15)
+                if response.status_code != 200:
+                    return None
+                with storage_open(self._get_image_savename(), 'wb') as fs:
+                    fs.write(response.content)
+            except StorageWriteError:
+                raise
+            except Exception:
+                return None
+        return self._get_image_savename()
+
+    def cleanup_temp(self):
+        try:
+            temp = getattr(self, '_temp_folder', None)
+            dest = getattr(self, '_dest_folder', None)
+            if (temp and os.path.isdir(temp) and
+                    os.path.abspath(temp) != os.path.abspath(dest or '')):
+                shutil.rmtree(temp, ignore_errors=True)
+        except Exception:
+            pass
+
+    def start_download(self):
+        if self._cancel_job:
+            return False
+        self._cancel_job = False
+        self._progress_unit = 'preparing'
+        self._create_dest_folder()
+        self.download_image()
+        if not self.is_target_video_exist():
+            self._create_temp_folder()
+            self._create_m3u8()
+            if not self._cancel_job:
+                self._prepareCrawl()
+            if not self._cancel_job and self._pending_set:
+                try:
+                    self._rescue_segments()
+                except StorageWriteError:
+                    raise
+                except Exception as exc:
+                    print(f'[segments] rescue failed: {exc}', flush=True)
+            if not self._cancel_job and not self._pending_set:
+                self._progress_unit = 'postprocess'
+                merged = self._mergeMp4Chunks()
+                if not merged and not self._cancel_job:
+                    raise Exception("merge/publish failed")
+            elif not self._cancel_job and self._can_skip_missing_segments():
+                skipped = sorted(i + 1 for i, _ in self._pending_set)
+                print(f'\n[{type(self).__name__}] {len(skipped)} segment(s) are missing on the '
+                      f'server ({", ".join(map(str, skipped))}); finishing the video without '
+                      f'them (a few seconds may be skipped).', flush=True)
+                self._skip_segments = {i for i, _ in self._pending_set}
+                self._progress_unit = 'postprocess'
+                merged = self._mergeMp4Chunks()
+                if not merged and not self._cancel_job:
+                    raise Exception("merge/publish failed")
+            elif not self._cancel_job:
+                pending = len(self._pending_set)
+                raise DownloadIncompleteError(pending)
+        else:
+            print("File already exists!", flush=True)
+
+        return not self._cancel_job
+
+    def cancel_download(self, cleanup=True):
+        print("\nCancelling download...", flush=True)
+        # cleanup=False is Pause: direct-MP4 downloads keep their partial file.
+        self._keep_partial_on_cancel = not cleanup
+        self._cancel_job = True
+        if self._t2_executor:
+            try: self._t2_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError: self._t2_executor.shutdown(wait=False)
+            self._t2_executor = None
+        if self._t_executor:
+            try: self._t_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError: self._t_executor.shutdown(wait=False)
+            self._t_executor = None
+        proc = getattr(self, '_ffmpeg_proc', None)
+        if proc is not None:
+            try: proc.kill()
+            except Exception: pass
+        if cleanup:
+            self.cleanup_temp()
+        print("\nDownload cancelled", flush=True)
+
+    def begin_concurrent_download(self):
+        self._t_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._t_future = self._t_executor.submit(self.start_download)
+
+    def is_concurrent_dowload_completed(self):
+        if not self._t_future or not self._t_future.done():
+            return False
+        self._t_future = None
+        return True
+
+    def end_concurrent_download(self):
+        if self._t_executor:
+            self._t_executor.shutdown(wait=False)
+            self._t_executor = None
+
+
+class SiteUrlList_M3U8:
+    def getLinks(self): return self.links
+    def getLinkDescs(self): return self.linkDescriptions
+    def getListType(self): return self.listType
+    def getTotalLinks(self): return self.totalLinks
+    def getTotalPages(self): return self.totalPages
+    def getCurrentPage(self): return self.currentPage
+    def getSortType(self): return self.sortType
+    def isVaildLinks(self): return False if self.islist is None else True
