@@ -1,0 +1,157 @@
+name: windows-build
+
+on:
+  workflow_dispatch:
+  # A version tag (v1.0.0) builds the exe and publishes it as a Release.
+  push:
+    tags: ["v*"]
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "pyproject.toml"
+      - "packaging/**"
+      - "THIRD_PARTY_NOTICES.md"
+      - "README.md"
+      - "WINDOWS_SECURITY.md"
+      - "scripts/**"
+      - "requirements.txt"
+      - "tests/**"
+      - ".github/workflows/windows-build.yml"
+
+permissions:
+  contents: write        # needed to create the Release on a version tag
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.10"
+          cache: pip
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -e ".[dev]"
+
+          New-Item -ItemType Directory -Force -Path .build-deps | Out-Null
+          python -m pip download `
+            --no-deps `
+            --no-cache-dir `
+            --no-binary=PyInstaller `
+            --dest .build-deps `
+            pyinstaller==6.13.0
+          $sdist = Get-Item -LiteralPath `
+            ".build-deps\pyinstaller-6.13.0.tar.gz"
+          $expectedSdist = "38911feec2c5e215e5159a7e66fdb12400168bd116143b54a8a7a37f08733456"
+          $actualSdist = (
+            Get-FileHash -Algorithm SHA256 -LiteralPath $sdist.FullName
+          ).Hash.ToLowerInvariant()
+          if ($actualSdist -ne $expectedSdist) {
+            throw "PyInstaller sdist hash mismatch"
+          }
+
+          # PyInstaller's bootloader guide requires removing any previously
+          # installed copy and cached wheel before forcing a source rebuild.
+          python -m pip uninstall --yes PyInstaller
+          python -m pip cache remove PyInstaller
+          $env:PYINSTALLER_COMPILE_BOOTLOADER = "1"
+          try {
+            python -m pip install `
+              --no-cache-dir `
+              --verbose `
+              $sdist.FullName
+          } finally {
+            Remove-Item Env:PYINSTALLER_COMPILE_BOOTLOADER -ErrorAction SilentlyContinue
+          }
+          python -c "import struct, PyInstaller; assert PyInstaller.__version__ == '6.13.0'; assert struct.calcsize('P') == 8"
+
+      - name: Run tests
+        run: python -m pytest tests/ -q --timeout=20
+
+      - name: Build Siphon
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist, build | Out-Null
+          Push-Location packaging\windows
+          python -m PyInstaller --noconfirm --clean --distpath ..\..\dist --workpath ..\..\build Siphon.spec
+          Pop-Location
+
+          $assetNames = @(
+            "Siphon.exe"
+          )
+          $checksums = foreach ($name in $assetNames) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist\$name").Hash
+            "$($hash.ToLowerInvariant())  $name"
+          }
+          [System.IO.File]::WriteAllLines(
+            (Join-Path (Resolve-Path "dist") "Siphon_SHA256SUMS.txt"),
+            $checksums,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Verify executable metadata
+        shell: pwsh
+        run: |
+          $expected = "1.1.0.0"
+          $files = @(
+            "dist\Siphon.exe"
+          )
+          foreach ($file in $files) {
+            if (!(Test-Path -LiteralPath $file)) { throw "Missing $file" }
+            $version = (Get-Item -LiteralPath $file).VersionInfo.FileVersion
+            if ($version -ne $expected) { throw "$file version $version; expected $expected" }
+            Write-Host "$file $version $((Get-Item -LiteralPath $file).Length) bytes"
+          }
+          foreach ($file in @(
+            "dist\Siphon_SHA256SUMS.txt"
+          )) {
+            if (!(Test-Path -LiteralPath $file)) { throw "Missing $file" }
+          }
+
+      - name: Generate artifact attestation
+        uses: actions/attest@v4
+        continue-on-error: true
+        with:
+          subject-path: |
+            dist/Siphon.exe
+            dist/Siphon_SHA256SUMS.txt
+
+      - name: Upload Windows executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: siphon-windows-${{ github.sha }}
+          path: |
+            dist/Siphon.exe
+            dist/Siphon_SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Publish the Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $tag = $env:GITHUB_REF_NAME
+          $assets = @("dist\Siphon.exe", "dist\Siphon_SHA256SUMS.txt")
+          # The release may already exist when the tag was made on the website.
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --title "Siphon $tag" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw "publishing the release failed" }
