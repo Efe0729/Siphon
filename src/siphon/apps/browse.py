@@ -865,6 +865,85 @@ class ModernApp(SettingsMixin, SitesMixin, BrowseTabMixin, DownloadsTabMixin, ct
         self._upload_tab = UploadTab(self, self._tab_frames['upload'], self._upmgr)
         self._build_settings_tab()
 
+        # ── Quick Speed & Concurrency Card in Left Sidebar ───────────
+        quick_card = ctk.CTkFrame(
+            rail_footer, fg_color=BG_CARD, corner_radius=CONTROL_RADIUS,
+            border_width=1, border_color=BORDER)
+        quick_card.pack(fill='x', pady=(0, 10), before=status_card)
+
+        dl_hdr = ctk.CTkFrame(quick_card, fg_color='transparent')
+        dl_hdr.pack(fill='x', padx=10, pady=(8, 2))
+        ctk.CTkLabel(
+            dl_hdr, text=f"⬇ {T('speed_limit_setting')}",
+            font=(ui_font(), 10, 'bold'), text_color=TEXT_SEC,
+            anchor='w').pack(side='left')
+        ctk.CTkLabel(
+            dl_hdr, text=T('up_parallel'),
+            font=(ui_font(), 10, 'bold'), text_color=TEXT_SEC,
+            anchor='e').pack(side='right')
+
+        dl_row = ctk.CTkFrame(quick_card, fg_color='transparent')
+        dl_row.pack(fill='x', padx=8, pady=(0, 8))
+        rail_dl_speed = ctk.CTkOptionMenu(
+            dl_row, values=self._speed_values(), variable=self._speed_var,
+            command=self._on_speed_change, width=116, height=30,
+            corner_radius=8, fg_color=BG_INPUT, button_color=BORDER_HOVER,
+            button_hover_color=ACCENT, text_color=TEXT_PRI,
+            dropdown_fg_color=BG_CARD, dropdown_hover_color=BG_CARD_HOVER,
+            dropdown_text_color=TEXT_PRI, font=(ui_font(), 10),
+            dropdown_font=(ui_font(), 10), dynamic_resizing=False)
+        rail_dl_speed.pack(side='left', fill='x', expand=True, padx=(0, 6))
+        self._speed_menus = getattr(self, '_speed_menus', []) + [rail_dl_speed]
+
+        ctk.CTkOptionMenu(
+            dl_row, values=[str(n) for n in range(1, MAX_CONCURRENT + 1)],
+            variable=self._conc_var, command=lambda _v: self._on_conc_change(),
+            width=56, height=30, corner_radius=8, fg_color=BG_INPUT,
+            button_color=BORDER_HOVER, button_hover_color=ACCENT,
+            text_color=TEXT_PRI, dropdown_fg_color=BG_CARD,
+            dropdown_hover_color=BG_CARD_HOVER, dropdown_text_color=TEXT_PRI,
+            font=(ui_font(), 10), dropdown_font=(ui_font(), 10),
+            dynamic_resizing=False).pack(side='right')
+
+        ctk.CTkFrame(quick_card, height=1, fg_color=BORDER, corner_radius=0).pack(
+            fill='x', padx=8)
+
+        up_hdr = ctk.CTkFrame(quick_card, fg_color='transparent')
+        up_hdr.pack(fill='x', padx=10, pady=(6, 2))
+        ctk.CTkLabel(
+            up_hdr, text=f"☁ {T('up_speed_limit')}",
+            font=(ui_font(), 10, 'bold'), text_color=TEXT_SEC,
+            anchor='w').pack(side='left')
+        ctk.CTkLabel(
+            up_hdr, text=T('up_parallel'),
+            font=(ui_font(), 10, 'bold'), text_color=TEXT_SEC,
+            anchor='e').pack(side='right')
+
+        up_row = ctk.CTkFrame(quick_card, fg_color='transparent')
+        up_row.pack(fill='x', padx=8, pady=(0, 8))
+        rail_up_speed = ctk.CTkOptionMenu(
+            up_row, values=self._upload_tab._speed_values(),
+            variable=self._upload_tab._speed_var,
+            command=self._upload_tab._on_speed, width=116, height=30,
+            corner_radius=8, fg_color=BG_INPUT, button_color=BORDER_HOVER,
+            button_hover_color=ACCENT, text_color=TEXT_PRI,
+            dropdown_fg_color=BG_CARD, dropdown_hover_color=BG_CARD_HOVER,
+            dropdown_text_color=TEXT_PRI, font=(ui_font(), 10),
+            dropdown_font=(ui_font(), 10), dynamic_resizing=False)
+        rail_up_speed.pack(side='left', fill='x', expand=True, padx=(0, 6))
+        self._upload_tab._speed_menu = rail_up_speed
+
+        ctk.CTkOptionMenu(
+            up_row, values=[str(n) for n in range(1, 9)],
+            variable=self._upload_tab._parallel_var,
+            command=lambda v: self._upmgr.set_parallel(int(v)),
+            width=56, height=30, corner_radius=8, fg_color=BG_INPUT,
+            button_color=BORDER_HOVER, button_hover_color=ACCENT,
+            text_color=TEXT_PRI, dropdown_fg_color=BG_CARD,
+            dropdown_hover_color=BG_CARD_HOVER, dropdown_text_color=TEXT_PRI,
+            font=(ui_font(), 10), dropdown_font=(ui_font(), 10),
+            dynamic_resizing=False).pack(side='right')
+
         self._select_tab(self._tab_keys[self._active_tab_idx])
 
     # ── continue downloads after a restart ───────────────────────────────

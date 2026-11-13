@@ -12,9 +12,10 @@ import customtkinter as ctk
 
 from siphon.i18n.locales import STRINGS, T, ui_font
 from siphon.ui.theme import (
-    ACCENT, ACCENT_HOVER, BG_BADGE, BG_CARD, BG_CARD_HOVER, BG_DARK, BG_INPUT,
-    BG_SECTION, BORDER, BORDER_HOVER, CONTROL_RADIUS, ERROR_C, SUCCESS,
-    TEXT_DIM, TEXT_PRI, TEXT_SEC, WARNING, color_for_mode,
+    ACCENT, ACCENT_DIM, ACCENT_HOVER, BG_BADGE, BG_CARD, BG_CARD_HOVER, BG_DARK,
+    BG_INPUT, BG_SECTION, BORDER, BORDER_CARD, BORDER_HOVER, CARD_RADIUS,
+    CONTROL_RADIUS, ERROR_C, ERROR_DIM, SUCCESS, SUCCESS_DIM, TEXT_DIM,
+    TEXT_PRI, TEXT_SEC, WARNING, WARNING_DIM, color_for_mode,
 )
 from siphon.core import config
 from siphon.upload import manager as um
@@ -161,8 +162,13 @@ for _lang_strings in STRINGS.values():
         _lang_strings.setdefault(_key, _text)
 
 _STATE_COLORS = {
-    um.WAITING: TEXT_SEC, um.UPLOADING: ACCENT, um.DONE: SUCCESS,
-    um.FAILED: ERROR_C, um.CANCELLED: TEXT_DIM, um.PAUSED: WARNING, um.SKIPPED: SUCCESS,
+    um.WAITING: WARNING, um.UPLOADING: ACCENT, um.DONE: SUCCESS,
+    um.FAILED: ERROR_C, um.CANCELLED: TEXT_DIM, um.PAUSED: TEXT_DIM, um.SKIPPED: SUCCESS,
+}
+
+_STATE_BACKGROUNDS = {
+    um.WAITING: WARNING_DIM, um.UPLOADING: ACCENT_DIM, um.DONE: SUCCESS_DIM,
+    um.FAILED: ERROR_DIM, um.CANCELLED: BG_BADGE, um.PAUSED: BG_BADGE, um.SKIPPED: SUCCESS_DIM,
 }
 
 
@@ -197,8 +203,8 @@ def _fmt_eta(seconds):
     return f'{h}:{m:02d}:{s:02d}' if h else f'{m}:{s:02d}'
 
 
-def _btn(parent, text, command, primary=False, width=0):
-    kwargs = dict(text=text, command=command, height=34, corner_radius=CONTROL_RADIUS,
+def _btn(parent, text, command, primary=False, width=0, text_color=None):
+    kwargs = dict(text=text, command=command, height=38, corner_radius=CONTROL_RADIUS,
                   font=(ui_font(), 11, 'bold' if primary else 'normal'))
     if width:
         kwargs['width'] = width
@@ -206,7 +212,7 @@ def _btn(parent, text, command, primary=False, width=0):
         kwargs.update(fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color='#ffffff')
     else:
         kwargs.update(fg_color='transparent', border_width=1, border_color=BORDER_HOVER,
-                      hover_color=BG_CARD_HOVER, text_color=TEXT_PRI)
+                      hover_color=BG_CARD_HOVER, text_color=text_color or TEXT_PRI)
     return ctk.CTkButton(parent, **kwargs)
 
 
@@ -220,17 +226,21 @@ class UploadTab:
         self._rendered_ids = None
         self._seen_version = -1
         self._remotes = []
+        self._filter = 'all'
+        self._speed_menus = []
         self._build()
         self.refresh_remotes()
         self._poll()
 
     # ── layout ─────────────────────────────────────────────────────────
     def _build(self):
-        top = ctk.CTkFrame(self.frame, fg_color=BG_SECTION, corner_radius=0)
-        top.pack(fill='x')
+        top = ctk.CTkFrame(
+            self.frame, fg_color=BG_CARD, corner_radius=CARD_RADIUS,
+            border_width=1, border_color=BORDER_CARD)
+        top.pack(fill='x', padx=16, pady=(14, 8))
 
         row = ctk.CTkFrame(top, fg_color='transparent')
-        row.pack(fill='x', padx=20, pady=(14, 6))
+        row.pack(fill='x', padx=18, pady=(12, 4))
         ctk.CTkLabel(row, text=T('up_account'), text_color=TEXT_SEC, width=110,
                      font=(ui_font(), 11, 'bold'), anchor='w').pack(side='left')
         self._remote_var = ctk.StringVar(value=um.get_remote() or T('up_no_account'))
@@ -249,10 +259,10 @@ class UploadTab:
         self._key_btn.pack(side='left', padx=(8, 0))
         self._key_lbl = ctk.CTkLabel(top, text='', text_color=TEXT_DIM, anchor='w',
                                      justify='left', wraplength=900, font=(ui_font(), 10))
-        self._key_lbl.pack(fill='x', padx=(150, 20), pady=(0, 2))
+        self._key_lbl.pack(fill='x', padx=(146, 18), pady=(0, 2))
 
         row = ctk.CTkFrame(top, fg_color='transparent')
-        row.pack(fill='x', padx=20, pady=6)
+        row.pack(fill='x', padx=18, pady=4)
         ctk.CTkLabel(row, text=T('up_folder'), text_color=TEXT_SEC, width=110,
                      font=(ui_font(), 11, 'bold'), anchor='w').pack(side='left')
         self._folder_var = ctk.StringVar(value=um.get_folder())
@@ -265,42 +275,15 @@ class UploadTab:
         entry.bind('<Return>', lambda _e: um.set_folder(self._folder_var.get()))
         _btn(row, T('up_choose'), self._choose_folder, width=90).pack(side='left')
 
-        row = ctk.CTkFrame(top, fg_color='transparent')
-        row.pack(fill='x', padx=20, pady=6)
-        ctk.CTkLabel(row, text=T('up_speed_limit'), text_color=TEXT_SEC, width=110,
-                     font=(ui_font(), 11, 'bold'), anchor='w').pack(side='left')
+        # Speed limit and parallel upload count are mounted in the left sidebar
+        # quick-controls card AND mirrored on the action bar just like Downloads.
         self._speed_var = ctk.StringVar(
             value=speed_limit.format_speed(um.get_bwlimit_bps(), T('unlimited')))
-        self._speed_menu = ctk.CTkOptionMenu(
-            row, values=self._speed_values(), variable=self._speed_var,
-            command=self._on_speed, width=140, height=34,
-            corner_radius=CONTROL_RADIUS, fg_color=BG_INPUT,
-            button_color=BORDER_HOVER, button_hover_color=ACCENT,
-            text_color=TEXT_PRI, dropdown_fg_color=BG_CARD,
-            dropdown_hover_color=BG_CARD_HOVER, dropdown_text_color=TEXT_PRI,
-            font=(ui_font(), 11), dropdown_font=(ui_font(), 11))
-        self._speed_menu.pack(side='left', padx=10)
-        ctk.CTkLabel(row, text=T('up_speed_limit_note'), text_color=TEXT_DIM,
-                     font=(ui_font(), 10)).pack(side='left')
-
-        row = ctk.CTkFrame(top, fg_color='transparent')
-        row.pack(fill='x', padx=20, pady=6)
-        ctk.CTkLabel(row, text=T('up_parallel'), text_color=TEXT_SEC, width=110,
-                     font=(ui_font(), 11, 'bold'), anchor='w').pack(side='left')
+        self._speed_menu = None
         self._parallel_var = ctk.StringVar(value=str(um.get_parallel()))
-        ctk.CTkOptionMenu(
-            row, values=[str(n) for n in range(1, um.MAX_PARALLEL + 1)],
-            variable=self._parallel_var, command=lambda v: self.mgr.set_parallel(int(v)),
-            width=80, height=34, corner_radius=CONTROL_RADIUS, fg_color=BG_INPUT,
-            button_color=BORDER_HOVER, button_hover_color=ACCENT, text_color=TEXT_PRI,
-            dropdown_fg_color=BG_CARD, dropdown_hover_color=BG_CARD_HOVER,
-            dropdown_text_color=TEXT_PRI, font=(ui_font(), 11),
-            dropdown_font=(ui_font(), 11)).pack(side='left', padx=10)
-        ctk.CTkLabel(row, text=T('up_parallel_note'), text_color=TEXT_DIM,
-                     font=(ui_font(), 10)).pack(side='left')
 
         row = ctk.CTkFrame(top, fg_color='transparent')
-        row.pack(fill='x', padx=20, pady=6)
+        row.pack(fill='x', padx=18, pady=4)
         ctk.CTkLabel(row, text=T('up_existing'), text_color=TEXT_SEC, width=110,
                      font=(ui_font(), 11, 'bold'), anchor='w').pack(side='left')
         existing_labels = {'skip': T('up_existing_skip'), 'replace': T('up_existing_replace')}
@@ -318,35 +301,89 @@ class UploadTab:
                      font=(ui_font(), 10)).pack(side='left')
 
         row = ctk.CTkFrame(top, fg_color='transparent')
-        row.pack(fill='x', padx=20, pady=(6, 4))
+        row.pack(fill='x', padx=18, pady=(6, 4))
         self._auto_var = ctk.BooleanVar(value=um.get_auto_upload())
         ctk.CTkSwitch(row, text=T('up_auto'), variable=self._auto_var,
                       command=lambda: um.set_auto_upload(self._auto_var.get()),
                       progress_color=ACCENT, text_color=TEXT_PRI,
-                      font=(ui_font(), 11)).pack(side='left', padx=(110, 0))
-        row = ctk.CTkFrame(top, fg_color='transparent')
-        row.pack(fill='x', padx=20, pady=(4, 6))
+                      font=(ui_font(), 11)).pack(side='left', padx=(110, 24))
         self._delete_var = ctk.BooleanVar(value=um.get_delete_after())
         ctk.CTkCheckBox(row, text=T('up_delete_after'), variable=self._delete_var,
                         command=self._on_delete_toggle, fg_color=ACCENT,
                         hover_color=ACCENT_HOVER, text_color=TEXT_PRI,
-                        font=(ui_font(), 11)).pack(side='left', padx=(110, 0))
+                        font=(ui_font(), 11)).pack(side='left')
 
         self._info_lbl = ctk.CTkLabel(top, text='', text_color=WARNING, anchor='w',
                                       justify='left', font=(ui_font(), 11),
                                       wraplength=820)
-        self._info_lbl.pack(fill='x', padx=(130, 20), pady=(0, 12))
+        self._info_lbl.pack(fill='x', padx=(128, 18), pady=(0, 8))
 
-        ctk.CTkFrame(self.frame, height=1, fg_color=BORDER, corner_radius=0).pack(fill='x')
+        # ── Floating Action Bar (matches Downloads tab layout & colors) ──
+        bar = ctk.CTkFrame(
+            self.frame, fg_color=BG_CARD, corner_radius=CARD_RADIUS,
+            border_width=1, border_color=BORDER_CARD, height=58)
+        bar.pack(fill='x', padx=16, pady=(0, 8))
+        bar.pack_propagate(False)
+        bar.grid_columnconfigure(1, weight=1)
 
-        bar = ctk.CTkFrame(self.frame, fg_color='transparent')
-        bar.pack(fill='x', padx=20, pady=10)
-        _btn(bar, T('up_add_folder'), self._add_folder, primary=True).pack(side='left')
-        _btn(bar, T('up_add_files'), self._add_files).pack(side='left', padx=8)
-        _btn(bar, T('up_clear_done'), self._clear_finished).pack(side='right')
-        _btn(bar, T('up_clear_cancelled'), self._clear_cancelled).pack(side='right', padx=(0, 8))
-        _btn(bar, T('up_retry_all'), self._retry_all).pack(side='right', padx=(0, 8))
-        _btn(bar, T('up_cancel_all'), self._cancel_all).pack(side='right', padx=(0, 8))
+        actions_left = ctk.CTkFrame(bar, fg_color='transparent')
+        actions_left.grid(row=0, column=0, padx=(16, 8), pady=10, sticky='w')
+        _btn(actions_left, T('up_add_folder'), self._add_folder, primary=True).pack(side='left')
+        _btn(actions_left, T('up_add_files'), self._add_files).pack(side='left', padx=(8, 0))
+
+        speed = ctk.CTkFrame(bar, fg_color='transparent')
+        speed.grid(row=0, column=1, pady=10)
+        ctk.CTkLabel(speed, text=T('speed_limit'), text_color=TEXT_DIM,
+                     font=(ui_font(), 10)).pack(side='left', padx=(0, 8))
+        bar_speed_menu = ctk.CTkOptionMenu(
+            speed, values=self._speed_values(), variable=self._speed_var,
+            command=self._on_speed, width=118, height=38,
+            corner_radius=CONTROL_RADIUS, fg_color=BG_INPUT,
+            button_color=BORDER_HOVER, button_hover_color=ACCENT,
+            text_color=TEXT_PRI, dropdown_fg_color=BG_CARD,
+            dropdown_hover_color=BG_CARD_HOVER, dropdown_text_color=TEXT_PRI,
+            font=(ui_font(), 10), dropdown_font=(ui_font(), 10))
+        bar_speed_menu.pack(side='left')
+        self._speed_menus.append(bar_speed_menu)
+
+        destructive = ctk.CTkFrame(bar, fg_color='transparent')
+        destructive.grid(row=0, column=2, padx=(8, 16), pady=10, sticky='e')
+        _btn(destructive, T('up_retry_all'), self._retry_all,
+             text_color=SUCCESS).pack(side='left')
+        _btn(destructive, T('up_cancel_all'), self._cancel_all,
+             text_color=ERROR_C).pack(side='left', padx=(8, 0))
+        _btn(destructive, T('up_clear_cancelled'), self._clear_cancelled,
+             text_color=WARNING).pack(side='left', padx=(8, 0))
+        _btn(destructive, T('up_clear_done'), self._clear_finished,
+             text_color=TEXT_SEC).pack(side='left', padx=(8, 0))
+
+        # ── Floating Filter, Sort & Summary Bar (matches Downloads tab) ──
+        filter_bar = ctk.CTkFrame(
+            self.frame, fg_color=BG_CARD, corner_radius=CARD_RADIUS,
+            border_width=1, border_color=BORDER_CARD, height=48)
+        filter_bar.pack(fill='x', padx=16, pady=(0, 6))
+        filter_bar.pack_propagate(False)
+        self._filter_labels = {
+            'all': T('queue_filter_all'),
+            'active': T('queue_filter_active'),
+            'queued': T('queue_filter_queued'),
+            'failed': T('queue_filter_failed'),
+            'done': T('queue_filter_done'),
+            'paused': T('queue_filter_paused'),
+        }
+        self._filter_var = ctk.StringVar(
+            value=self._filter_labels[self._filter])
+        ctk.CTkSegmentedButton(
+            filter_bar, values=list(self._filter_labels.values()),
+            variable=self._filter_var,
+            command=self._on_filter_change,
+            height=32, corner_radius=CONTROL_RADIUS,
+            fg_color=BG_INPUT, selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOVER,
+            unselected_color=BG_INPUT,
+            unselected_hover_color=BG_CARD_HOVER,
+            text_color=TEXT_PRI, font=(ui_font(), 10, 'bold')).pack(
+                side='left', padx=16, pady=8)
 
         # The same orders the Download list offers, so one habit covers both.
         self._sort = config.get_upload_sort()
@@ -357,7 +394,7 @@ class UploadTab:
         }
         self._sort_var = ctk.StringVar(value=self._sort_labels[self._sort])
         ctk.CTkOptionMenu(
-            bar, values=list(self._sort_labels.values()),
+            filter_bar, values=list(self._sort_labels.values()),
             variable=self._sort_var, command=self._on_sort_change,
             width=150, height=32, corner_radius=CONTROL_RADIUS,
             fg_color=BG_INPUT, button_color=BORDER_HOVER,
@@ -365,11 +402,12 @@ class UploadTab:
             dropdown_fg_color=BG_CARD, dropdown_hover_color=BG_CARD_HOVER,
             dropdown_text_color=TEXT_PRI, font=(ui_font(), 10),
             dropdown_font=(ui_font(), 11), dynamic_resizing=False).pack(
-                side='left', padx=8)
+                side='left', pady=8)
 
-        self._summary_lbl = ctk.CTkLabel(self.frame, text='', text_color=TEXT_SEC, anchor='w',
-                                         font=(ui_font(), 11))
-        self._summary_lbl.pack(fill='x', padx=22, pady=(0, 4))
+        self._summary_lbl = ctk.CTkLabel(
+            filter_bar, text='', text_color=TEXT_SEC, anchor='e',
+            font=(ui_font(), 11, 'bold'))
+        self._summary_lbl.pack(side='right', padx=16)
 
         # Virtual list: only the rows that fit on screen exist; scrolling
         # re-fills them with other uploads, so every upload is reachable and a
@@ -516,7 +554,17 @@ class UploadTab:
             bps = speed_limit.parse_speed(
                 '0' if value == T('unlimited') else value) or 0
         self.mgr.set_speed_limit(bps)
-        self._speed_menu.configure(values=self._speed_values())
+        values = self._speed_values()
+        if self._speed_menu is not None:
+            try:
+                self._speed_menu.configure(values=values)
+            except tk.TclError:
+                pass
+        for menu in getattr(self, '_speed_menus', []):
+            try:
+                menu.configure(values=values)
+            except tk.TclError:
+                pass
         self._speed_var.set(speed_limit.format_speed(bps, T('unlimited')))
 
     def _on_delete_toggle(self):
@@ -670,7 +718,8 @@ class UploadTab:
             self._queue_pos = {jid: n + 1 for n, jid in enumerate(self.mgr.queue_ids())}
             self._update_summary(all_jobs)
             self._starts_in = self._start_estimates(all_jobs)
-            self._view_jobs = all_jobs
+            self._view_jobs = self._filter_jobs(all_jobs)
+            self._all_jobs_count = len(all_jobs)
         jobs = self._view_jobs
         total = len(jobs)
         visible = self._visible_count()
@@ -679,6 +728,10 @@ class UploadTab:
             if total:
                 self._empty_lbl.place_forget()
             else:
+                empty_key = ('queue_filter_empty'
+                             if getattr(self, '_all_jobs_count', 0) and getattr(self, '_filter', 'all') != 'all'
+                             else 'up_empty')
+                self._empty_lbl.configure(text=T(empty_key))
                 self._empty_lbl.place(relx=0.5, y=40, anchor='n')
             width = max(1, self._viewport.winfo_width())
             for slot, w in enumerate(self._pool):
@@ -816,6 +869,27 @@ class UploadTab:
         except tk.TclError:
             pass                      # the window is closing
 
+    def _on_filter_change(self, label):
+        reverse = {value: key for key, value in self._filter_labels.items()}
+        self._filter = reverse.get(label, 'all')
+        self._first = 0
+        self._view_jobs = []
+        self._render()
+
+    def _filter_jobs(self, jobs):
+        f = getattr(self, '_filter', 'all')
+        if f == 'active':
+            return [j for j in jobs if j.state == um.UPLOADING]
+        if f == 'queued':
+            return [j for j in jobs if j.state == um.WAITING]
+        if f == 'failed':
+            return [j for j in jobs if j.state in (um.FAILED, um.CANCELLED)]
+        if f == 'done':
+            return [j for j in jobs if j.state in (um.DONE, um.SKIPPED)]
+        if f == 'paused':
+            return [j for j in jobs if j.state == um.PAUSED]
+        return jobs
+
     def _on_sort_change(self, label):
         """Put the list in the order the person picked, and keep it."""
         reverse = {text: key for key, text in self._sort_labels.items()}
@@ -856,9 +930,9 @@ class UploadTab:
         Laid out like a Download row: one short horizontal strip, with the
         progress bar on the right instead of a full-width bar of its own.
         """
-        row = ctk.CTkFrame(self._viewport, fg_color=BG_CARD, corner_radius=8,
-                           border_width=1, border_color=BORDER,
-                           height=self.ROW_HEIGHT - 8)
+        row = ctk.CTkFrame(self._viewport, fg_color=BG_CARD, corner_radius=CARD_RADIUS,
+                           border_width=1, border_color=BORDER_CARD,
+                           height=self.ROW_HEIGHT - 12)
         row.pack_propagate(False)     # keep the fixed row size
         w = {'row': row, 'job_id': None, '_placed': None, 'q_visible': False,
              'last_q': None, 'q_editor': None}
@@ -880,10 +954,11 @@ class UploadTab:
                                     text_color=TEXT_SEC, font=(ui_font(), 9),
                                     command=lambda: self._queue_step(w['job_id'], +1))
 
-        state_holder = ctk.CTkFrame(row, width=90, height=30, corner_radius=6,
+        state_holder = ctk.CTkFrame(row, width=92, height=32, corner_radius=6,
                                     fg_color=BG_BADGE)
-        state_holder.pack(side='left', padx=(12, 10))
+        state_holder.pack(side='left', padx=(14, 10))
         state_holder.pack_propagate(False)
+        w['state_holder'] = state_holder
         w['state'] = ctk.CTkLabel(state_holder, text='', font=(ui_font(), 10, 'bold'))
         w['state'].pack(fill='both', expand=True, padx=4)
 
@@ -1087,6 +1162,7 @@ class UploadTab:
         w['sig'] = sig
         put = lambda key, **kw: self._put(w, key, **kw)
         try:
+            put('state_holder', fg_color=_STATE_BACKGROUNDS.get(job.state, BG_BADGE))
             put('state', text=T('up_state_' + job.state),
                 text_color=_STATE_COLORS.get(job.state, TEXT_SEC))
             if w.get('_bar_value') != job.progress:
