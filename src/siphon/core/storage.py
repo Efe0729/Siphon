@@ -44,6 +44,8 @@ class StorageWriteError(OSError):
 class _StorageFile:
     def __init__(self, path, mode, *args, **kwargs):
         self.path = path
+        if 'w' in mode:
+            show_when_finished(path)
         try:
             self.file = open(path, mode, *args, **kwargs)
         except OSError as exc:

@@ -590,15 +590,25 @@ class MediaSite(M3U8Crawler):
             return False
         if total > 0 and done < total:
             raise Exception("Download incomplete (connection dropped? retry)")
-        self._safe_remove(state_path)
         self._progress_unit = 'postprocess'
-        try:
-            os.replace(part, out)
-        except OSError as exc:
-            raise StorageWriteError(out, exc) from exc
-        except Exception:
-            self._safe_remove(part)
-            raise
+        show_when_finished(part)
+        last_replace_exc = None
+        for _ in range(8):
+            try:
+                os.replace(part, out)
+                last_replace_exc = None
+                break
+            except PermissionError as exc:
+                last_replace_exc = exc
+                time.sleep(0.25)
+            except OSError as exc:
+                raise StorageWriteError(out, exc) from exc
+            except Exception:
+                self._safe_remove(part)
+                raise
+        if last_replace_exc is not None:
+            raise StorageWriteError(out, last_replace_exc) from last_replace_exc
+        self._safe_remove(state_path)
         show_when_finished(out)
         print(f"\nDownload complete: {os.path.basename(out)}", flush=True)
         return True
@@ -753,6 +763,8 @@ class MediaSite(M3U8Crawler):
                                 if report and self._progress_callback:
                                     self._progress_callback(current_done, total, speed)
                             _save_state()
+                            if range_written[index] >= _room():
+                                break
 
                     if self._cancel_job or _stopped():
                         break
