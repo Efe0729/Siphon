@@ -343,3 +343,45 @@ def test_pause_does_not_wait_for_a_connection_that_has_gone_quiet(tmp_path):
         assert (tmp_path / 'v.mp4.part.state.json').exists()
     finally:
         server.shutdown()
+
+
+def test_a_quality_missing_on_the_server_falls_back_to_the_next_one(tmp_path):
+    """The page listed a 1080p file the server no longer had (HTTP 404); the
+    720p one was there and should have been downloaded instead."""
+    from siphon.sites.downloader import MediaSite
+    job = MediaSite.__new__(MediaSite)
+    job._cancel_job = False
+    job.direct_site_name = 'Site'
+    job._direct_url = 'https://cdn.example/1080.mp4'
+    job._direct_fallbacks = ['https://cdn.example/720.mp4',
+                             'https://cdn.example/480.mp4']
+    job._get_video_savename = lambda: str(tmp_path / 'video.mp4')
+    tried = []
+
+    def once():
+        tried.append(job._direct_url)
+        if job._direct_url.endswith('1080.mp4'):
+            raise Exception('Direct download failed (HTTP 404)')
+        return True
+
+    job._download_direct_once = once
+    assert job._download_direct() is True
+    assert tried == ['https://cdn.example/1080.mp4', 'https://cdn.example/720.mp4']
+
+
+def test_when_no_quality_is_left_the_404_is_reported(tmp_path):
+    from siphon.sites.downloader import MediaSite
+    job = MediaSite.__new__(MediaSite)
+    job._cancel_job = False
+    job.direct_site_name = 'Site'
+    job._direct_url = 'https://cdn.example/only.mp4'
+    job._direct_fallbacks = []
+    job._get_video_savename = lambda: str(tmp_path / 'video.mp4')
+
+    def once():
+        raise Exception('Direct download failed (HTTP 404)')
+
+    job._download_direct_once = once
+    import pytest
+    with pytest.raises(Exception, match='HTTP 404'):
+        job._download_direct()

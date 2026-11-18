@@ -103,7 +103,7 @@ jobs:
       - name: Verify executable metadata
         shell: pwsh
         run: |
-          $expected = "1.1.0.0"
+          $expected = "1.1.1.0"
           $files = @(
             "dist\Siphon.exe"
           )
@@ -148,9 +148,14 @@ jobs:
           $tag = $env:GITHUB_REF_NAME
           $assets = @("dist\Siphon.exe", "dist\Siphon_SHA256SUMS.txt")
           # The release may already exist when the tag was made on the website.
+          # Hand-written notes for this version, when there are any.
+          $notes = "docs/releases/$tag.md"
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag @assets --clobber
+            if (Test-Path -LiteralPath $notes) { gh release edit $tag --notes-file $notes }
+          } elseif (Test-Path -LiteralPath $notes) {
+            gh release create $tag @assets --title "Siphon $tag" --notes-file $notes
           } else {
             gh release create $tag @assets --title "Siphon $tag" --generate-notes
           }

@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_product_identity_and_release_channels_are_centralized():
     assert metadata.PRODUCT_NAME == "Siphon"
-    assert metadata.VERSION == "1.1.0"
+    assert metadata.VERSION == "1.1.1"
     # The updater downloads and runs whatever it finds in this repository, so
     # it may only ever name the one this app is published from.  Empty means
     # "not published yet", and update checking stays switched off.

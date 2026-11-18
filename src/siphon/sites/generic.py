@@ -1165,11 +1165,17 @@ class SiteGeneric(MediaSite):
         self._imageUrl = kvs._meta(text, 'image') or None
         self._extra_headers = headers
 
-        selected = kvs.select_source([s for s in sources if s['kind'] == 'direct'],
-                                     self._resolution_pref)
+        direct = [s for s in sources if s['kind'] == 'direct']
+        selected = kvs.select_source(direct, self._resolution_pref)
         if selected:
             self._direct_url = selected['url']
             self._direct_referer = found_on
+        # The other qualities, best first: a server sometimes lists a file it
+        # no longer has (HTTP 404), and the next one down still plays.
+        self._direct_fallbacks = [
+            s['url'] for s in sorted(direct, key=lambda s: (s['height'] or 0, s['rank']),
+                                     reverse=True)
+            if not selected or s['url'] != selected['url']]
         # HLS playlists are tried first (they carry every quality); a plain
         # MP4 found alongside them is the fallback.
         self._hls_sources = [(f'{name} HLS', s['url'], headers)

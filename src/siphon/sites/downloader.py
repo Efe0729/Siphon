@@ -479,7 +479,8 @@ class MediaSite(M3U8Crawler):
         (HTTP 403/410 – expired token, too many connections) wait, fetch a
         fresh link from the video page and continue; progress is kept."""
         attempts = max(1, int(getattr(self, 'direct_refresh_attempts', 3)))
-        for attempt in range(attempts):
+        attempt = 0
+        while True:
             try:
                 return self._download_direct_once()
             except StorageWriteError:
@@ -487,11 +488,14 @@ class MediaSite(M3U8Crawler):
             except Exception as exc:
                 match = re.search(r'HTTP (\d{3})', str(exc))
                 code = int(match.group(1)) if match else 0
-                if self._cancel_job or code not in (403, 410, 429) or attempt == attempts - 1:
+                if not self._cancel_job and code == 404 and self._next_direct_quality():
+                    continue
+                if self._cancel_job or code not in (403, 410, 429) or attempt >= attempts - 1:
                     raise
-                wait = 10 * (attempt + 1)
+                attempt += 1
+                wait = 10 * attempt
                 print(f'\n[{self.direct_site_name}] Video server answered HTTP {code}; '
-                      f'getting a fresh link in {wait}s (try {attempt + 2}/{attempts}).',
+                      f'getting a fresh link in {wait}s (try {attempt + 1}/{attempts}).',
                       flush=True)
                 for _ in range(wait * 4):
                     if self._cancel_job:
@@ -502,7 +506,24 @@ class MediaSite(M3U8Crawler):
                 except Exception as refresh_exc:
                     print(f'[{self.direct_site_name}] Fresh link failed: {refresh_exc}', flush=True)
                     raise exc
-        return False
+
+    def _next_direct_quality(self):
+        """Switch to the next quality the page listed, if there is one.
+
+        Used when the video server says the chosen file is not there (HTTP
+        404).  The half-made file of the missing quality is thrown away: a
+        different quality is a different file."""
+        fallbacks = list(getattr(self, '_direct_fallbacks', None) or [])
+        if not fallbacks:
+            return False
+        self._direct_url = fallbacks.pop(0)
+        self._direct_fallbacks = fallbacks
+        part = self._get_video_savename() + '.part'
+        self._safe_remove(part)
+        self._safe_remove(part + '.state.json')
+        print(f'\n[{self.direct_site_name}] the video server does not have this '
+              'quality (HTTP 404); trying the next one the page lists.', flush=True)
+        return True
 
     def _direct_get(self, session, url, headers):
         """GET for direct downloads.  Sites with ``direct_browser_session``
@@ -556,7 +577,7 @@ class MediaSite(M3U8Crawler):
                 raise
             except Exception as range_exc:
                 if (self._cancel_job or self._load_direct_state(part) is not None
-                        or re.search(r'HTTP (?:401|403|410|429)', str(range_exc))):
+                        or re.search(r'HTTP (?:401|403|404|410|429)', str(range_exc))):
                     # Progress is saved: report the error and let a retry /
                     # Resume continue from it instead of starting over.
                     raise
@@ -624,7 +645,7 @@ class MediaSite(M3U8Crawler):
             probe = self._direct_get(
                 session, self._direct_url, {'Referer': ref, 'Range': 'bytes=0-0'})
             status = int(getattr(probe, 'status_code', 0) or 0)
-            if status in (401, 403, 410, 429):
+            if status in (401, 403, 404, 410, 429):
                 self._log_refusal(probe)
                 refused = status
             info = _content_range(getattr(probe, 'headers', {}).get('content-range'))
@@ -997,9 +1018,11 @@ class MediaSite(M3U8Crawler):
                 raise Exception("Connection closed early")
             except StorageWriteError:
                 raise
-            except Exception:
+            except Exception as exc:
                 if self._cancel_job:
                     break
+                if 'HTTP 404' in str(exc):
+                    raise           # the file is not there; asking again won't help
                 retries += 1
                 if retries > _DIRECT_RANGE_RETRIES:
                     raise

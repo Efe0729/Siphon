@@ -4,7 +4,7 @@ from __future__ import annotations
 
 
 PRODUCT_NAME = "Siphon"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 COMPANY_NAME = "Efe0729"
 # ─────────────────────────────────────────────────────────────────────────
 # Your own repository, as "owner/name" (for example "efe/Siphon").  While
