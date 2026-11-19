@@ -125,6 +125,38 @@ def find_asset_url(release_info, channel='browse'):
     return ''
 
 
+def find_checksum_url(release_info):
+    assets = (release_info or {}).get('assets') or {}
+    for key in ('Siphon_SHA256SUMS.txt',):
+        if assets.get(key):
+            return str(assets[key])
+    return ''
+
+
+def fetch_expected_sha256(release_info, asset_name, timeout=10):
+    """Return the expected lowercase SHA-256 hex digest for ``asset_name``, or ''."""
+    url = find_checksum_url(release_info)
+    if not url or not asset_name:
+        return ''
+    try:
+        with _session() as s:
+            resp = s.get(url, timeout=timeout, **config.proxy_request_kwargs())
+        if getattr(resp, 'status_code', 0) != 200:
+            return ''
+        for raw_line in str(resp.text or '').splitlines():
+            parts = raw_line.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            digest, filename = parts[0].strip().lower(), parts[1].strip().lstrip('*')
+            if (len(digest) == 64
+                    and all(c in '0123456789abcdef' for c in digest)
+                    and os.path.basename(filename) == asset_name):
+                return digest
+    except Exception:
+        pass
+    return ''
+
+
 def is_frozen():
     return bool(getattr(sys, 'frozen', False))
 
@@ -137,9 +169,13 @@ def _remove_quiet(path):
         pass
 
 
-def download_asset(url, dest_path, progress_cb=None, timeout=60):
+def download_asset(url, dest_path, progress_cb=None, timeout=60,
+                   expected_sha256=''):
+    import hashlib
     part_path = dest_path + '.part'
     _remove_quiet(part_path)
+    expected = str(expected_sha256 or '').strip().lower()
+    hasher = hashlib.sha256() if expected else None
     try:
         with _session() as s, s.get(
                 url, stream=True, timeout=timeout,
@@ -153,6 +189,8 @@ def download_asset(url, dest_path, progress_cb=None, timeout=60):
                     if not chunk:
                         continue
                     f.write(chunk)
+                    if hasher is not None:
+                        hasher.update(chunk)
                     downloaded += len(chunk)
                     if progress_cb:
                         try:
@@ -167,6 +205,9 @@ def download_asset(url, dest_path, progress_cb=None, timeout=60):
             if f.read(2) != b'MZ':
                 _remove_quiet(part_path)
                 return False
+        if hasher is not None and hasher.hexdigest().lower() != expected:
+            _remove_quiet(part_path)
+            return False
         os.replace(part_path, dest_path)
         return True
     except Exception:

@@ -257,6 +257,9 @@ class UploadTab:
         self._connect_btn.pack(side='left', padx=(8, 0))
         self._key_btn = _btn(row, T('up_key_btn'), self._open_key_dialog)
         self._key_btn.pack(side='left', padx=(8, 0))
+        self._remove_btn = _btn(row, T('up_remove_account'), self._remove_remote,
+                                text_color=ERROR_C)
+        self._remove_btn.pack(side='left', padx=(8, 0))
         self._key_lbl = ctk.CTkLabel(top, text='', text_color=TEXT_DIM, anchor='w',
                                      justify='left', wraplength=900, font=(ui_font(), 10))
         self._key_lbl.pack(fill='x', padx=(146, 18), pady=(0, 2))
@@ -479,11 +482,54 @@ class UploadTab:
             self._remote_var.set(T('up_no_account'))
         um.set_remote(self._current_remote())
         self._info(error or ('' if names else T('up_need_account')))
+        self._sync_remote_buttons()
         self._refresh_key_status()
+
+    def _sync_remote_buttons(self):
+        has_remote = bool(self._current_remote())
+        for btn in (getattr(self, '_key_btn', None),
+                    getattr(self, '_remove_btn', None)):
+            if btn is not None:
+                try:
+                    btn.configure(state='normal' if has_remote else 'disabled')
+                except tk.TclError:
+                    pass
 
     def _on_remote(self, value):
         um.set_remote(value if value in self._remotes else '')
+        self._sync_remote_buttons()
         self._refresh_key_status()
+
+    def _remove_remote(self):
+        remote = self._current_remote()
+        if not remote:
+            self._info(T('up_need_account'))
+            return
+        if not messagebox.askyesno(
+                T('tab_upload'),
+                T('up_remove_confirm', name=remote),
+                parent=self.app):
+            return
+        self._remove_btn.configure(state='disabled')
+
+        def work():
+            err = ''
+            try:
+                rclone.delete_remote(remote)
+            except Exception as exc:
+                err = str(exc)
+
+            def done():
+                if err:
+                    self._sync_remote_buttons()
+                    self._info(err, ERROR_C)
+                    return
+                self.refresh_remotes()
+                self._info(T('up_removed_done', name=remote), SUCCESS)
+
+            self._ui(done)
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ── own Google client ID ───────────────────────────────────────────
     def _refresh_key_status(self):

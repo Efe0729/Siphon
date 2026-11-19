@@ -191,6 +191,14 @@ def set_drive_client(name, client_id, client_secret):
                   f'client_secret={client_secret.strip()}', 'config_refresh_token=true'])
 
 
+def delete_remote(name):
+    """Remove an rclone remote configuration by name."""
+    target = str(name or '').strip()
+    if not target:
+        raise RcloneError('no remote selected')
+    _run(['config', 'delete', target])
+
+
 def chunk_size_for(bps, seconds=20):
     """Drive upload piece size that finishes in about ``seconds`` at ``bps``.
 

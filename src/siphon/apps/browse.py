@@ -22,6 +22,7 @@ from siphon import sites as M3U8Sites
 from siphon.core import dl_history
 from siphon.core.ssl import get_shared_ssl_context
 from siphon.core import secretstore
+from siphon.core import updater
 from siphon.core.config import headers
 from siphon.i18n.locales import T, set_lang, get_lang, ui_font, LANGUAGES
 from siphon.ui import scroll as ui_scroll
@@ -341,6 +342,7 @@ class ModernApp(SettingsMixin, SitesMixin, BrowseTabMixin, DownloadsTabMixin, ct
         self._update_checking = False
         self._update_installing = False
         self._update_prompt_shown = False
+        self._update_prompt_widgets = None
         self._update_status_text = ''
         self._update_status_color = TEXT_DIM
         self._update_badge = None
@@ -400,6 +402,8 @@ class ModernApp(SettingsMixin, SitesMixin, BrowseTabMixin, DownloadsTabMixin, ct
             self.after(250, self._first_run_language_prompt)
         self.after(1500 if self._needs_lang_prompt else 700,
                    self._browser_first_run_notice)
+        if not updater.UPDATES_DISABLED:
+            self.after(2500, self._start_update_check)
 
     def _browser_first_run_notice(self):
         """Say, once, that Siphon will drive a real browser on this computer.
@@ -1243,7 +1247,39 @@ class ModernApp(SettingsMixin, SitesMixin, BrowseTabMixin, DownloadsTabMixin, ct
 
 
     # ── Close ────────────────────────────────────────────────────────
+    def _has_active_transfers(self):
+        dl_mgr = getattr(self, '_dlmgr', None)
+        up_mgr = getattr(self, '_upmgr', None)
+        dl_active = int(getattr(dl_mgr, 'active_count', 0) or 0) if dl_mgr else 0
+        try:
+            up_active = sum(1 for j in up_mgr.jobs() if getattr(j, 'state', '') == 'uploading') if up_mgr else 0
+        except Exception:
+            up_active = 0
+        return dl_active, up_active
+
     def _on_close(self):
+        if not getattr(self, '_startup_complete', True):
+            self._is_closing = True
+            self._close_requested = True
+            return
+        if not getattr(self, '_update_installing', False):
+            dl_active, up_active = self._has_active_transfers()
+            if dl_active > 0 or up_active > 0:
+                parts = []
+                if dl_active:
+                    parts.append(T('close_confirm_downloads', n=dl_active))
+                if up_active:
+                    parts.append(T('close_confirm_uploads', n=up_active))
+                details = '\n'.join(f'• {p}' for p in parts)
+                try:
+                    ok = messagebox.askyesno(
+                        T('close_confirm_title'),
+                        T('close_confirm_body', details=details),
+                        parent=self)
+                except tk.TclError:
+                    ok = True
+                if not ok:
+                    return
         self._is_closing = True
         try:
             from siphon.core import browser as real_browser
@@ -1254,9 +1290,6 @@ class ModernApp(SettingsMixin, SitesMixin, BrowseTabMixin, DownloadsTabMixin, ct
             self._upmgr.close()
         except Exception:
             pass
-        if not getattr(self, '_startup_complete', True):
-            self._close_requested = True
-            return
         try:
             self._thumb_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:

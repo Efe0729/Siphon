@@ -47,11 +47,49 @@ class SettingsMixin:
 
     def _short_update_note(self, info):
         notes = (info or {}).get('notes') or ''
-        for line in notes.splitlines():
-            line = line.strip()
-            if line:
-                return line[:180]
+        for raw_line in notes.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith('<') or line.startswith('#'):
+                continue
+            if set(line) <= {'-', '=', '*', '_', ' '}:
+                continue
+            cleaned = line.replace('**', '').replace('__', '').replace('`', '').strip()
+            if cleaned.startswith('- '):
+                cleaned = cleaned[2:].strip()
+            if cleaned:
+                return cleaned[:180]
         return ''
+
+    def _set_prompt_progress(self, pct=None, text=''):
+        widgets = getattr(self, '_update_prompt_widgets', None)
+        if not widgets:
+            return
+        try:
+            prompt = widgets.get('prompt')
+            if prompt is None or not prompt.winfo_exists():
+                return
+            lbl = widgets.get('status_lbl')
+            bar = widgets.get('progress_bar')
+            if lbl is not None and text:
+                lbl.configure(text=text)
+            if bar is not None and pct is not None:
+                if not bar.winfo_manager():
+                    bar.pack(fill='x', pady=(10, 0))
+                bar.set(max(0.0, min(1.0, float(pct) / 100.0)))
+        except tk.TclError:
+            pass
+
+    def _close_update_prompt(self):
+        widgets = getattr(self, '_update_prompt_widgets', None) or {}
+        prompt = widgets.get('prompt')
+        self._update_prompt_widgets = None
+        if prompt is not None:
+            try:
+                prompt.destroy()
+            except tk.TclError:
+                pass
 
     def _show_update_prompt(self, info):
         if self._is_closing or self._update_prompt_shown:
@@ -65,7 +103,7 @@ class SettingsMixin:
             prompt.resizable(False, False)
             prompt.transient(self)
 
-            pos_width, pos_height = 420, 220
+            pos_width, pos_height = 440, 240
             self.update_idletasks()
             x = self.winfo_rootx() + max((self.winfo_width() - pos_width) // 2, 0)
             y = self.winfo_rooty() + 80
@@ -84,28 +122,31 @@ class SettingsMixin:
             ctk.CTkLabel(
                 body, text=T('update_available', version=tag),
                 font=(ui_font(), 12), text_color=TEXT_SEC,
-                wraplength=360, justify='left'
-            ).pack(anchor='w', pady=(12, 0))
+                wraplength=390, justify='left'
+            ).pack(anchor='w', pady=(10, 0))
 
             note = self._short_update_note(info)
             if note:
                 ctk.CTkLabel(
                     body, text=note, font=(ui_font(), 10),
-                    text_color=TEXT_DIM, wraplength=360, justify='left'
-                ).pack(anchor='w', pady=(8, 0))
+                    text_color=TEXT_DIM, wraplength=390, justify='left'
+                ).pack(anchor='w', pady=(6, 0))
+
+            status_lbl = ctk.CTkLabel(
+                body, text='', font=(ui_font(), 10),
+                text_color=ACCENT, wraplength=390, justify='left')
+            status_lbl.pack(anchor='w', pady=(8, 0))
+
+            progress_bar = ctk.CTkProgressBar(
+                body, height=8, corner_radius=4,
+                fg_color=BG_INPUT, progress_color=ACCENT)
+            progress_bar.set(0.0)
 
             row = ctk.CTkFrame(body, fg_color='transparent')
-            row.pack(fill='x', pady=(18, 0))
+            row.pack(fill='x', pady=(14, 0))
 
             def _close():
-                try:
-                    prompt.destroy()
-                except tk.TclError:
-                    pass
-
-            def _install():
-                _close()
-                self._start_update_install()
+                self._close_update_prompt()
 
             later_btn = ctk.CTkButton(
                 row, text=T('update_prompt_later'), width=118, height=34,
@@ -113,13 +154,28 @@ class SettingsMixin:
                 border_color=BORDER_HOVER, hover_color=BG_CARD_HOVER,
                 text_color=TEXT_PRI, command=_close)
 
+            def _install():
+                update_btn.configure(state='disabled')
+                status_lbl.configure(text=T('update_downloading', pct=0), text_color=ACCENT)
+                if not progress_bar.winfo_manager():
+                    progress_bar.pack(fill='x', pady=(8, 0), before=row)
+                self._start_update_install()
+
             update_btn = ctk.CTkButton(
-                row, text=T('update_now_btn'), width=118, height=34,
+                row, text=T('update_now_btn'), width=130, height=34,
                 corner_radius=8, fg_color=ACCENT, hover_color=ACCENT_HOVER,
                 text_color=('#FFFFFF', '#FFFFFF'), command=_install
             )
             update_btn.pack(side='right')
             later_btn.pack(side='right', padx=(0, 8))
+
+            self._update_prompt_widgets = {
+                'prompt': prompt,
+                'status_lbl': status_lbl,
+                'progress_bar': progress_bar,
+                'update_btn': update_btn,
+                'later_btn': later_btn,
+            }
 
             prompt.protocol('WM_DELETE_WINDOW', _close)
             prompt.bind('<Escape>', lambda _event: _close())
@@ -130,6 +186,7 @@ class SettingsMixin:
             prompt.focus_force()
             later_btn.focus_force()
         except Exception:
+            self._update_prompt_widgets = None
             if prompt is not None:
                 try:
                     prompt.destroy()
@@ -263,26 +320,73 @@ class SettingsMixin:
 
         self._update_installing = True
         self._set_update_status(T('update_downloading', pct=0), TEXT_SEC)
+        self._set_prompt_progress(0, T('update_downloading', pct=0))
+        if getattr(self, '_update_badge', None) is not None:
+            try:
+                self._update_badge.configure(text='↓ 0%')
+            except tk.TclError:
+                pass
 
         def _worker():
             exe_dir = os.path.dirname(sys.executable)
             new_path = os.path.join(exe_dir, name + '.new')
+            last_pct = [-1]
 
             def _progress(downloaded, total):
                 pct = int(downloaded * 100 / total) if total else 0
-                self._ui(lambda p=pct: self._set_update_status(
-                    T('update_downloading', pct=p), TEXT_SEC))
+                if pct == last_pct[0]:
+                    return
+                last_pct[0] = pct
 
-            ok = updater.download_asset(url, new_path, progress_cb=_progress)
+                def _ui_step(p=pct):
+                    msg = T('update_downloading', pct=p)
+                    self._set_update_status(msg, TEXT_SEC)
+                    self._set_prompt_progress(p, msg)
+                    if getattr(self, '_update_badge', None) is not None:
+                        try:
+                            self._update_badge.configure(text=f'↓ {p}%')
+                        except tk.TclError:
+                            pass
+
+                self._ui(_ui_step)
+
+            expected_sha256 = updater.fetch_expected_sha256(info, name)
+            ok = updater.download_asset(
+                url, new_path, progress_cb=_progress,
+                expected_sha256=expected_sha256)
             if ok and updater.apply_update_and_restart(new_path):
-                self._ui(lambda: self._set_update_status(
-                    T('update_restarting'), SUCCESS))
-                self._ui(self._on_close)
+                def _restarting():
+                    msg = T('update_restarting')
+                    self._set_update_status(msg, SUCCESS)
+                    self._set_prompt_progress(100, msg)
+                    if getattr(self, '_update_badge', None) is not None:
+                        try:
+                            self._update_badge.configure(text='↻ ...')
+                        except tk.TclError:
+                            pass
+                    self._close_update_prompt()
+                    self._on_close()
+
+                self._ui(_restarting)
                 return
 
             def _failed():
                 self._update_installing = False
-                self._set_update_status(T('update_failed'), ERROR_C)
+                msg = T('update_failed')
+                self._set_update_status(msg, ERROR_C)
+                self._set_prompt_progress(text=msg)
+                widgets = getattr(self, '_update_prompt_widgets', None) or {}
+                btn = widgets.get('update_btn')
+                if btn is not None:
+                    try:
+                        btn.configure(state='normal')
+                    except tk.TclError:
+                        pass
+                if getattr(self, '_update_badge', None) is not None:
+                    try:
+                        self._update_badge.configure(text=T('update_new_badge'))
+                    except tk.TclError:
+                        pass
 
             self._ui(_failed)
 

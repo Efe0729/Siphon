@@ -151,3 +151,52 @@ def test_apply_update_and_restart_passes_clean_env(monkeypatch, tmp_path):
         bat_text = fh.read()
     assert 'set "_PYI_PARENT_PROCESS_LEVEL="' in bat_text
     assert 'set "_PYI_APPLICATION_HOME_DIR="' in bat_text
+
+
+def test_download_asset_verifies_expected_sha256(monkeypatch, tmp_path):
+    import hashlib
+
+    payload = b'MZ' + b'\x00' * 3_000_001
+    good_hash = hashlib.sha256(payload).hexdigest()
+    bad_hash = '0' * 64
+
+    _patch_session(monkeypatch, _FakeResp(chunks=[payload]))
+    dest = str(tmp_path / 'bad.exe')
+    assert updater.download_asset(
+        'http://x/app.exe', dest, expected_sha256=bad_hash) is False
+    assert not (tmp_path / 'bad.exe').exists()
+
+    _patch_session(monkeypatch, _FakeResp(chunks=[payload]))
+    dest_ok = str(tmp_path / 'good.exe')
+    assert updater.download_asset(
+        'http://x/app.exe', dest_ok, expected_sha256=good_hash) is True
+    assert (tmp_path / 'good.exe').exists()
+
+
+def test_fetch_expected_sha256_parses_checksums_asset(monkeypatch):
+    digest = 'a' * 64
+
+    class _SumResp:
+        status_code = 200
+        text = f'{digest}  Siphon.exe\n'
+
+    monkeypatch.setattr(updater, '_session', lambda: _FakeSession(_SumResp()))
+    info = {'assets': {'Siphon_SHA256SUMS.txt': 'https://example.invalid/sums.txt'}}
+    assert updater.fetch_expected_sha256(info, 'Siphon.exe') == digest
+    assert updater.fetch_expected_sha256(info, 'Other.exe') == ''
+
+
+def test_short_update_note_skips_html_and_headings():
+    from siphon.apps.app_settings import SettingsMixin
+
+    info = {
+        'notes': (
+            '<div align="center">\n\n'
+            '# ◈ Siphon v1.1.2\n\n'
+            '**The real video, not the advert next to it.**\n\n'
+            '</div>\n'
+        )
+    }
+    assert SettingsMixin._short_update_note(None, info) == (
+        'The real video, not the advert next to it.'
+    )

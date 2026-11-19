@@ -71,3 +71,44 @@ def test_drain_discards_stale_and_closing_callbacks():
     callbacks.put((1, lambda: called.append('closed')))
     browse.ModernApp._drain_ui_callbacks(app)
     assert called == ['current']
+
+
+def test_close_prompts_when_active_transfers_exist(monkeypatch):
+    destroyed = []
+    prompts = []
+
+    def _make_app(answer=False, installing=False):
+        return SimpleNamespace(
+            _startup_complete=True,
+            _is_closing=False,
+            _close_requested=False,
+            _update_installing=installing,
+            _dlmgr=SimpleNamespace(active_count=1, _lock=threading.Lock(), _items={}, save_csv=lambda *a: None, cancel_all=lambda **k: None),
+            _upmgr=SimpleNamespace(jobs=lambda: [SimpleNamespace(state='uploading')], close=lambda: None),
+            _thumb_executor=SimpleNamespace(shutdown=lambda **k: None),
+            _save_resume_list=lambda: None,
+            _has_active_transfers=lambda: browse.ModernApp._has_active_transfers(SimpleNamespace(
+                _dlmgr=SimpleNamespace(active_count=1),
+                _upmgr=SimpleNamespace(jobs=lambda: [SimpleNamespace(state='uploading')]),
+            )),
+            destroy=lambda: destroyed.append(True),
+        )
+
+    monkeypatch.setattr(browse.messagebox, 'askyesno',
+                        lambda title, body, **k: prompts.append((title, body)) or False)
+    app = _make_app(answer=False)
+    browse.ModernApp._on_close(app)
+    assert len(prompts) == 1
+    assert not app._is_closing
+    assert not destroyed
+
+    monkeypatch.setattr(browse.messagebox, 'askyesno',
+                        lambda title, body, **k: prompts.append((title, body)) or True)
+    browse.ModernApp._on_close(app)
+    assert len(prompts) == 2
+    assert app._is_closing and destroyed == [True]
+
+    app_upd = _make_app(installing=True)
+    browse.ModernApp._on_close(app_upd)
+    assert len(prompts) == 2
+    assert app_upd._is_closing and len(destroyed) == 2

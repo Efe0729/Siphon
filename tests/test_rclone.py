@@ -156,3 +156,12 @@ def test_a_finished_or_unreachable_transfer_cannot_be_re_limited():
 
     # Nothing is listening on that port: it must say no, not raise.
     assert rclone.set_live_bwlimit(Running(), 1000) is False
+
+
+def test_delete_remote_runs_rclone_config_delete(monkeypatch):
+    seen = []
+    monkeypatch.setattr(rclone, '_run', lambda args, timeout=60: seen.append(args) or '')
+    rclone.delete_remote('gdrive')
+    assert seen == [['config', 'delete', 'gdrive']]
+    with pytest.raises(rclone.RcloneError):
+        rclone.delete_remote('')
