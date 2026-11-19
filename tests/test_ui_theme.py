@@ -46,15 +46,15 @@ def test_windows_version_resources_match_app_version():
     root = Path(__file__).resolve().parents[1]
     workflow = (root / '.github' / 'workflows' / 'windows-build.yml').read_text(
         encoding='utf-8')
-    assert '$expected = "1.1.1.0"' in workflow
+    assert '$expected = "1.1.2.0"' in workflow
     packaging = root / 'packaging' / 'windows'
     generator = (packaging / 'gen_version.py').read_text(
         encoding='utf-8')
-    assert 'VERSION = (1, 1, 1, 0)' in generator
+    assert 'VERSION = (1, 1, 2, 0)' in generator
     for name in ('Siphon.version',):
         resource = (packaging / name).read_text(encoding='utf-8')
-        assert 'filevers=(1, 1, 1, 0)' in resource
-        assert "StringStruct('FileVersion', '1.1.1.0')" in resource
+        assert 'filevers=(1, 1, 2, 0)' in resource
+        assert "StringStruct('FileVersion', '1.1.2.0')" in resource
         assert "StringStruct('ProductName', 'Siphon')" in resource
     for name in ('Siphon.spec',):
         spec = (packaging / name).read_text(encoding='utf-8')

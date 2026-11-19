@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 1, 1, 0),
-    prodvers=(1, 1, 1, 0),
+    filevers=(1, 1, 2, 0),
+    prodvers=(1, 1, 2, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -15,11 +15,11 @@ VSVersionInfo(
       StringTable('040904B0', [
         StringStruct('CompanyName', 'Efe0729'),
         StringStruct('FileDescription', 'Siphon - Download from any site you add'),
-        StringStruct('FileVersion', '1.1.1.0'),
+        StringStruct('FileVersion', '1.1.2.0'),
         StringStruct('InternalName', 'Siphon'),
         StringStruct('OriginalFilename', 'Siphon.exe'),
         StringStruct('ProductName', 'Siphon'),
-        StringStruct('ProductVersion', '1.1.1.0')
+        StringStruct('ProductVersion', '1.1.2.0')
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
