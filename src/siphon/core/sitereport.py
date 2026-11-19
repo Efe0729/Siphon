@@ -6,7 +6,7 @@ A report turns what they can see into something that can be acted on.
 
 Two rules shape what goes in it.
 
-It carries the diagnosis, not just the complaint.  "example.com does not work"
+It carries the diagnosis, not just the complaint.  "this site does not work"
 costs a day of guessing; the same report saying the title came from
 ``title_tag`` and was the same text on all three videos names the fault
 outright.  So the report holds what the check worked out, field by field,

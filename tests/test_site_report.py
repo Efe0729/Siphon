@@ -25,7 +25,7 @@ def test_a_site_read_correctly_needs_no_report():
 
 
 def test_the_same_title_on_every_video_is_named_as_the_fault():
-    """The example.com case: the rule was reading a notice printed site-wide."""
+    """A real case: the rule was reading a notice printed site-wide."""
     broken = dict(_good(), sample_titles=['New Backup Domain'] * 3,
                   title_rule='title_tag')
     assert sitereport.diagnose(broken) == 'every video gets the same title'
@@ -198,7 +198,7 @@ def test_the_report_says_why_a_listing_was_empty():
     broken = dict(_good(), listed=0, thumbs=0,
                   listing_why='40 links on the page, no video cards; most '
                               'were passed over: no picture in the link')
-    _title, body = sitereport.build('example.com', broken)
+    _title, body = sitereport.build('example.org', broken)
     assert 'Why none were found' in body
     assert 'no picture in the link' in body
 
@@ -233,7 +233,7 @@ def test_the_report_carries_the_page_shape_when_the_listing_failed():
                   listing_why='no video cards',
                   listing_shape='link 1: div.card > a.link\n'
                                 '    picture inside the link: no')
-    _title, body = sitereport.build('example.com', broken)
+    _title, body = sitereport.build('example.org', broken)
     assert 'How the page is built' in body
     assert 'div.card > a.link' in body
 

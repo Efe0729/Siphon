@@ -86,7 +86,7 @@ def test_kvs_sites_start_from_the_known_layout():
 
 
 def test_a_search_that_answers_with_the_front_page_is_refused(tmp_path):
-    """example.com answered an unknown address with its home page, so the old
+    """A site answered an unknown address with its home page, so the old
     check ("did videos come back?") passed and every search showed the same
     36 videos.  The answer must differ from the front page."""
     import functools, http.server, threading
@@ -431,17 +431,17 @@ def test_links_to_other_sites_are_counted_as_such():
 
 # ── cards whose picture is not inside the link ────────────────────────────
 
-site_SHAPED = '<html><body>' + ''.join(
+BESIDE_THE_LINK = '<html><body>' + ''.join(
     f'<div class="videostream"><img class="thumb" src="/t{n}.jpg">'
     f'<a class="link" href="/v6{n}abc-a-clip-{n}.html">Clip {n}</a></div>'
     for n in range(6)) + '</body></html>'
 
 
 def test_a_card_is_read_when_its_picture_sits_beside_the_link():
-    """site builds a card as a box holding a picture and, beside it, a
+    """Some sites build a card as a box holding a picture and, beside it, a
     link.  Every link was passed over for having no picture of its own, so
     the whole listing read as empty."""
-    videos = gb.parse_videos(site_SHAPED, ROOT)
+    videos = gb.parse_videos(BESIDE_THE_LINK, ROOT)
     assert len(videos) == 6
     assert videos[0]['title'] == 'Clip 0'
     assert videos[0]['thumbnail'] == 'https://example.com/t0.jpg'

@@ -234,11 +234,19 @@ def slug_to_title(slug):
 
 
 def _site_suffix_re(site_name, root):
-    names = {re.escape(n) for n in (site_name, (urlsplit(root).hostname or '').replace('www.', ''))
+    """" - SiteName" and the slogan that often follows it, at a title's end.
+
+    "ABC-123 - Example ｜ Watch Online" has the site's name ("example", from
+    example.com) after a separator, then the site's slogan; both go.
+    """
+    host = (urlsplit(root).hostname or '').replace('www.', '')
+    label = host.split('.')[0] if host else ''
+    names = {re.escape(n) for n in (site_name, host, label if len(label) >= 3 else '')
              if n}
     if not names:
         return None
-    return re.compile(r'\s*[-|–—:]\s*(?:' + '|'.join(names) + r')(?:\.com)?\s*$', re.I)
+    return re.compile(r'\s*[-|｜–—:]\s*(?:' + '|'.join(sorted(names, key=len, reverse=True))
+                      + r')(?:\.[a-z]{2,6})?(?:\s*[-|｜–—:].*)?\s*$', re.I)
 
 
 def pick_title(text, url, candidates=(), site_name='', root=''):

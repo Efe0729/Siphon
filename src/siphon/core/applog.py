@@ -129,8 +129,6 @@ _PHRASES = [
     ('；來源失效、存取受限或播放器改版）', '; source dead, restricted or player changed)'),
     ('Sitenin tüm adresleri Cloudflare tarafından engellendi — VPN ya da başka bir ağ deneyin (all mirrors blocked by Cloudflare)',
      'All mirrors are blocked by Cloudflare (network/IP reputation; try a VPN or another network)'),
-    ('Video sunucusu (example.com) Cloudflare tarafından engellendi — VPN/WARP ya da başka bir ağ deneyin',
-     'Video CDN (example.com) is blocked by Cloudflare; try a VPN/WARP or another network'),
 ]
 _PHRASES.sort(key=lambda pair: len(pair[0]), reverse=True)
 _HAS_CJK = __import__('re').compile(r'[㐀-鿿＀-￯ğüşıöçĞÜŞİÖÇ]')
@@ -188,6 +186,11 @@ def _open_log(name: str) -> Path | None:
 _REDACT_AFTER = re.compile(
     r'^(?P<keep>.*?\b(?:File name|Save location|Download folder|Thumbnail|'
     r'Downloading|Download complete|title)\s*:\s*)(?P<secret>.+)$', re.I)
+# Upload lines name the file and the cloud folder it went to.
+_UPLOAD = re.compile(
+    r'^(?P<keep>.*?\[Upload\] (?:Done|Paused|Resumed|Failed to start|Failed|Cancelled|'
+    r'Already there, skipped):\s*)(?P<secret>.+?)(?P<tail>: (?!.* -> ).*)?$')
+_UPLOAD_RCLONE = re.compile(r'^(?P<keep>.*?\[Upload\] ).+?(?P<tail>: rclone: .*)$')
 _URL = re.compile(r'\bhttps?://([^\s/]+)(/\S*)?')
 _WIN_PATH = re.compile(r'\b[A-Za-z]:\\[^\s"\']+')
 _HIDDEN = '<hidden>'
@@ -226,7 +229,11 @@ def redact(line: str) -> str:
 
     line = _KEPT.sub(park, line)
     found = _REDACT_AFTER.match(line)
-    if found:
+    upload = _UPLOAD.match(line) or _UPLOAD_RCLONE.match(line)
+    if upload and not found:
+        tail = upload.groupdict().get('tail') or ''
+        line = upload.group('keep') + _HIDDEN + _WIN_PATH.sub(_HIDDEN, tail)
+    elif found:
         line = found.group('keep') + _HIDDEN
     else:
         line = _URL.sub(lambda m: f'https://{m.group(1)}/{_HIDDEN}'

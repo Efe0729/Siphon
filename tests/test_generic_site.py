@@ -621,3 +621,78 @@ def test_the_saved_pages_address_is_read_whatever_order_its_tag_is_in():
         "<meta content='https://s.test/v/9' property='og:url'>"
     ) == 'https://s.test/v/9'
     assert generic.page_address('<head></head>') == ''
+
+
+def _packed_page(script):
+    """A page whose player settings are hidden by Dean Edwards' packer."""
+    import re
+    from siphon.sites import generic
+    words = sorted(set(re.findall(r'\b\w+\b', script)), key=len, reverse=True)
+    table = {word: generic._to_base(i, 36) for i, word in enumerate(words)}
+    packed = re.sub(r'\b\w+\b', lambda m: table[m.group(0)], script).replace("'", "\\'")
+    return ("<video src='https://ads.example/promo-clip.mp4'></video>"
+            "<script>eval(function(p,a,c,k,e,d){e=function(c){return c};}"
+            f"('{packed}',36,{len(words)},'{'|'.join(words)}'.split('|'),0,{{}}))</script>")
+
+
+def test_a_player_hidden_in_a_packed_script_is_found():
+    """A real case: the page's only plain .mp4 was an advert; the real
+    playlist sat in a packed script."""
+    from siphon.sites import generic
+    page = _packed_page("f='https://cdn.example/abc-123/playlist.m3u8';source=f;")
+    hls = [s['url'] for s in generic.find_sources(page, 'https://site.example/v/abc')
+           if s['kind'] == 'hls']
+    assert hls == ['https://cdn.example/abc-123/playlist.m3u8']
+
+
+def test_the_page_says_how_long_its_video_is():
+    from siphon.sites import generic
+    assert generic.page_duration('<meta property="og:video:duration" content="3600">') == 3600
+    assert generic.page_duration('{"duration": "PT1H2M3S"}') == 3723
+    assert generic.page_duration('<p>no length here</p>') == 0
+
+
+def test_a_tiny_file_for_a_ten_minute_video_is_not_kept(tmp_path):
+    from siphon.sites.downloader import MediaSite
+    job = MediaSite.__new__(MediaSite)
+    job._cancel_job = False
+    job.direct_site_name = 'Site'
+    job._page_seconds = 600
+    out = tmp_path / 'video.mp4'
+    job._get_video_savename = lambda: str(out)
+    job._direct_url = 'https://ads.example/promo.mp4'
+    job._direct_fallbacks = ['https://cdn.example/real.mp4']
+    tried = []
+
+    def once():
+        tried.append(job._direct_url)
+        size = 1_000_000 if 'promo' in job._direct_url else 10_000_000
+        with open(out, 'wb') as fh:
+            fh.truncate(size)
+        return True
+
+    job._download_direct_once = once
+    assert job._download_direct() is True
+    assert tried == ['https://ads.example/promo.mp4', 'https://cdn.example/real.mp4']
+    assert out.stat().st_size == 10_000_000
+
+
+def test_the_site_name_and_its_slogan_come_off_a_title():
+    from siphon.sites import generic
+    found = generic.title_candidates(
+        '<meta property="og:title" content="ABC-123 - Example ｜ Watch HD Online">',
+        'https://example.com/en/v/9')
+    assert found['og_title'] == 'ABC-123'
+    kept = generic.title_candidates(
+        '<meta property="og:title" content="Love story - Part 2">',
+        'https://site.example/v/1')
+    assert kept['og_title'] == 'Love story - Part 2'
+
+
+def test_upload_lines_keep_names_and_folders_out_of_the_log_file():
+    from siphon.core.applog import redact
+    assert redact('[Upload] Done: My video.mp4 -> gdrive:Videos/Private') == '[Upload] Done: <hidden>'
+    assert redact('[Upload] Failed: a.mp4 -> gdrive:X: rclone exited with code 1') == \
+        '[Upload] Failed: <hidden>: rclone exited with code 1'
+    assert redact('[Upload] 3 upload(s) from the last session continue') == \
+        '[Upload] 3 upload(s) from the last session continue'

@@ -211,9 +211,70 @@ def _add(found, url, label, page_url, tier):
                   'rank': -(tier * 1000 + len(found))})
 
 
+# Many players hide their settings in a script "packed" with Dean Edwards'
+# packer: eval(function(p,a,c,k,e,d){...}('...', base, count, 'w0|w1|...'.split('|'))).
+# The video address is in there in pieces; unpacking puts it back together.
+_PACKED_RE = re.compile(
+    r"}\s*\(\s*'((?:[^'\\]|\\.)*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*"
+    r"'((?:[^'\\]|\\.)*)'\.split\('\|'\)", re.S)
+_DIGITS = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+
+def _to_base(number, base):
+    if number == 0:
+        return '0'
+    out = ''
+    while number:
+        number, rest = divmod(number, base)
+        out = _DIGITS[rest] + out
+    return out
+
+
+def unpack_scripts(text):
+    """The unpacked text of every packed script on the page ('' if none)."""
+    pieces = []
+    for packed, base, count, words in _PACKED_RE.findall(text or '')[:10]:
+        try:
+            base, count = int(base), int(count)
+            if not 2 <= base <= 62:
+                continue
+            words = words.split('|')
+            body = packed.replace("\\'", "'").replace('\\\\', '\\')
+            table = {}
+            for number in range(min(count, len(words))):
+                if words[number]:
+                    table[_to_base(number, base)] = words[number]
+            pieces.append(re.sub(r'\b\w+\b',
+                                 lambda m: table.get(m.group(0), m.group(0)), body))
+        except Exception:
+            continue
+    return '\n'.join(pieces)
+
+
+def page_duration(text):
+    """How long the page says its video is, in seconds (0 when it does not say)."""
+    text = text or ''
+    found = re.search(r'<meta[^>]+(?:property|name)=["\'](?:og:)?video:duration["\']'
+                      r'[^>]+content=["\'](\d+)', text, re.I)
+    if found:
+        return int(found.group(1))
+    found = re.search(r'(?:itemprop=["\']duration["\'][^>]*content=["\']|'
+                      r'"duration"\s*:\s*")P(?:T)?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?',
+                      text, re.I)
+    if found and any(found.groups()):
+        hours, minutes, seconds = (int(g or 0) for g in found.groups())
+        return hours * 3600 + minutes * 60 + seconds
+    return 0
+
+
 def find_sources(text, page_url):
     """Every playable address the page offers, best quality last."""
     text = text or ''
+    unpacked = unpack_scripts(text)
+    if unpacked:
+        # Searched like the rest of the page; it usually holds the real player
+        # settings, which a page full of adverts and previews hides this way.
+        text = text + '\n' + unpacked
     found = []
 
     flashvars = kvs.parse_flashvars(text)
@@ -1162,6 +1223,7 @@ class SiteGeneric(MediaSite):
         else:
             _note_site_trouble(self._url, 'the page gave no title')
         self._targetName = title
+        self._page_seconds = page_duration(text)
         self._imageUrl = kvs._meta(text, 'image') or None
         self._extra_headers = headers
 
@@ -1182,6 +1244,9 @@ class SiteGeneric(MediaSite):
                              for s in reversed(sources) if s['kind'] == 'hls'][:3]
         if self._hls_sources:
             self._m3u8url = self._hls_sources[0][1]
+        for kind, chosen in (('HLS', self._m3u8url), ('file', self._direct_url)):
+            if chosen:
+                print(f'[{name}] video {kind} from {urlsplit(chosen).hostname}', flush=True)
         if not self._direct_url and not self._hls_sources:
             _note_site_trouble(self._url, 'nothing playable on the page')
             raise Exception(f'{name}: no playable video source on this page')

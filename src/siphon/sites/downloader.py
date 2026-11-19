@@ -482,7 +482,15 @@ class MediaSite(M3U8Crawler):
         attempt = 0
         while True:
             try:
-                return self._download_direct_once()
+                finished = self._download_direct_once()
+                if finished and self._far_too_small():
+                    if self._next_direct_quality(reason='too_small'):
+                        continue
+                    raise Exception(
+                        'The file the page offered is far too small for the '
+                        'video (it looks like an advert or a preview), so it '
+                        'was not kept')
+                return finished
             except StorageWriteError:
                 raise
             except Exception as exc:
@@ -507,7 +515,31 @@ class MediaSite(M3U8Crawler):
                     print(f'[{self.direct_site_name}] Fresh link failed: {refresh_exc}', flush=True)
                     raise exc
 
-    def _next_direct_quality(self):
+    def _far_too_small(self):
+        """Whether the finished file cannot be the video the page describes.
+
+        A page that says its video runs an hour does not get a 2 MB file: that
+        is an advert or a preview clip that sat on the page next to the player.
+        Even a poor 240p video takes about 25 KB a second, so anything under a
+        fifth of that is not it.  Pages that do not say how long they are, and
+        short videos, are never judged."""
+        seconds = int(getattr(self, '_page_seconds', 0) or 0)
+        if seconds < 120:
+            return False
+        out = self._get_video_savename()
+        try:
+            size = os.path.getsize(out)
+        except OSError:
+            return False
+        if size >= seconds * 5000:
+            return False
+        print(f'\n[{self.direct_site_name}] the file is {size / 1048576:.1f} MB but the '
+              f'page says the video runs {seconds // 60} min; that is not the video '
+              '(an advert or a preview?)', flush=True)
+        self._safe_remove(out)
+        return True
+
+    def _next_direct_quality(self, reason='missing'):
         """Switch to the next quality the page listed, if there is one.
 
         Used when the video server says the chosen file is not there (HTTP
@@ -521,8 +553,12 @@ class MediaSite(M3U8Crawler):
         part = self._get_video_savename() + '.part'
         self._safe_remove(part)
         self._safe_remove(part + '.state.json')
-        print(f'\n[{self.direct_site_name}] the video server does not have this '
-              'quality (HTTP 404); trying the next one the page lists.', flush=True)
+        if reason == 'missing':
+            print(f'\n[{self.direct_site_name}] the video server does not have this '
+                  'quality (HTTP 404); trying the next one the page lists.', flush=True)
+        else:
+            print(f'\n[{self.direct_site_name}] trying the next video address the '
+                  'page lists.', flush=True)
         return True
 
     def _direct_get(self, session, url, headers):

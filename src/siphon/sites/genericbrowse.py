@@ -108,7 +108,7 @@ def _shape(path):
         # the video's name: '/v6abc-a-title.html' is the same family as
         # '/v6def-another.html'.  Without this every such address was a
         # family of one and no family ever reached the three links needed to
-        # count as a listing, which is why site read as empty.
+        # count as a listing, which is why one site's listing read as empty.
         bare = re.sub(r'\.(?:html?|php|aspx?|jsp)$', '', segment, flags=re.I)
         if segment.isdigit():
             parts.append('#')
@@ -153,8 +153,8 @@ def _image_of(link):
     background image.  All of them count as "this link is a video card".
 
     The picture does not have to be inside the link.  Plenty of sites build
-    a card as a box holding a picture and, beside it, a link — site does,
-    and every one of its links was passed over for having no picture of its
+    a card as a box holding a picture and, beside it, a link.  On one such
+    site every one of its links was passed over for having no picture of its
     own, so its listing read as empty.  When the link holds none, the box
     around it is searched, under one condition: see _image_beside().
     """
@@ -325,7 +325,7 @@ def _picture_near(link, levels=5):
 
 # Where a site keeps its own furniture.  A link in here is a menu item, not
 # a video, and describing three of those says nothing about the listing —
-# which is exactly what the first sample of site did.
+# which is exactly what an early sample did.
 _FURNITURE = ('header', 'nav', 'footer', 'aside')
 
 
