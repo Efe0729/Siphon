@@ -178,6 +178,45 @@ def _bat_quote(path):
     return '"' + str(path).replace('"', '""').replace('%', '%%') + '"'
 
 
+def _clean_restart_env(env=None):
+    """Strip PyInstaller bootloader variables so a restarted exe extracts fresh.
+
+    Without this, the helper batch script inherits ``_PYI_PARENT_PROCESS_LEVEL``
+    and ``_PYI_APPLICATION_HOME_DIR`` (or ``_MEIPASS2``) and passes them to the
+    updated executable, so its bootloader skips extraction and fails trying to
+    load ``python*.dll`` from the exiting process's deleted ``_MEI*`` temp folder.
+    """
+    cleaned = dict(os.environ if env is None else env)
+    mei_dirs = []
+    meipass = getattr(sys, '_MEIPASS', '')
+    if meipass:
+        mei_dirs.append(os.path.normcase(os.path.normpath(meipass)))
+    for key in list(cleaned):
+        upper = key.upper()
+        if upper.startswith('_PYI_') or upper in ('_MEIPASS', '_MEIPASS2'):
+            val = cleaned.pop(key, '')
+            if val and ('_MEI' in val.upper() or upper in ('_PYI_APPLICATION_HOME_DIR', '_MEIPASS', '_MEIPASS2')):
+                mei_dirs.append(os.path.normcase(os.path.normpath(val)))
+    if mei_dirs:
+        for tk_key in ('TCL_LIBRARY', 'TK_LIBRARY'):
+            val = cleaned.get(tk_key, '')
+            norm = os.path.normcase(os.path.normpath(val)) if val else ''
+            if norm and any(norm == d or norm.startswith(d + os.sep) for d in mei_dirs):
+                cleaned.pop(tk_key, None)
+        path_key = 'PATH' if 'PATH' in cleaned else ('Path' if 'Path' in cleaned else '')
+        if path_key:
+            kept = [
+                part for part in cleaned[path_key].split(os.pathsep)
+                if not any(
+                    os.path.normcase(os.path.normpath(part)) == d
+                    or os.path.normcase(os.path.normpath(part)).startswith(d + os.sep)
+                    for d in mei_dirs if part
+                )
+            ]
+            cleaned[path_key] = os.pathsep.join(kept)
+    return cleaned
+
+
 def apply_update_and_restart(new_exe_path):
     if PERSONAL_FORK or not is_frozen():
         return False
@@ -187,6 +226,12 @@ def apply_update_and_restart(new_exe_path):
         bat = os.path.join(tempfile.gettempdir(), f'siphon_update_{pid}.bat')
         body = f"""@echo off
 setlocal
+set "_PYI_PARENT_PROCESS_LEVEL="
+set "_PYI_APPLICATION_HOME_DIR="
+set "_PYI_ARCHIVE_FILE="
+set "_PYI_SPLASH_IPC="
+set "_MEIPASS="
+set "_MEIPASS2="
 set /a n=0
 :retry
 move /Y {_bat_quote(new_exe_path)} {_bat_quote(cur)} >nul 2>&1
@@ -198,6 +243,7 @@ goto retry
 :giveup
 del {_bat_quote(new_exe_path)} >nul 2>&1
 :done
+ping -n 2 127.0.0.1 >nul
 start "" {_bat_quote(cur)}
 del "%~f0" >nul 2>&1
 """
@@ -209,7 +255,7 @@ del "%~f0" >nul 2>&1
             getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
         )
         subprocess.Popen(['cmd', '/c', bat], creationflags=flags,
-                         close_fds=True)
+                         env=_clean_restart_env(), close_fds=True)
         return True
     except Exception:
         return False

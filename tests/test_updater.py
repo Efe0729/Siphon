@@ -95,3 +95,59 @@ def test_download_asset_rejects_http_error(monkeypatch, tmp_path):
     _patch_session(monkeypatch, _FakeResp(status=404, chunks=[b'']))
     dest = str(tmp_path / 'out.exe')
     assert updater.download_asset('http://x/app.exe', dest) is False
+
+
+def test_clean_restart_env_strips_pyinstaller_vars(monkeypatch):
+    import os
+    import sys
+
+    mei = os.path.join('C:\\Temp', '_MEI221482')
+    monkeypatch.setattr(sys, '_MEIPASS', mei, raising=False)
+    sample = {
+        'SYSTEMROOT': 'C:\\Windows',
+        '_PYI_PARENT_PROCESS_LEVEL': '1',
+        '_PYI_APPLICATION_HOME_DIR': mei,
+        '_PYI_ARCHIVE_FILE': 'C:\\Desktop\\Siphon.exe',
+        '_MEIPASS2': mei,
+        'TCL_LIBRARY': os.path.join(mei, '_tcl_data'),
+        'TK_LIBRARY': os.path.join(mei, '_tk_data'),
+        'PATH': os.pathsep.join([mei, 'C:\\Windows\\System32']),
+    }
+
+    cleaned = updater._clean_restart_env(sample)
+    assert cleaned['SYSTEMROOT'] == 'C:\\Windows'
+    for gone in ('_PYI_PARENT_PROCESS_LEVEL', '_PYI_APPLICATION_HOME_DIR',
+                 '_PYI_ARCHIVE_FILE', '_MEIPASS2', 'TCL_LIBRARY', 'TK_LIBRARY'):
+        assert gone not in cleaned
+    assert cleaned['PATH'] == 'C:\\Windows\\System32'
+
+
+def test_apply_update_and_restart_passes_clean_env(monkeypatch, tmp_path):
+    import subprocess
+    import sys
+    import tempfile
+
+    monkeypatch.setattr(updater, 'is_frozen', lambda: True)
+    monkeypatch.setattr(sys, 'executable', str(tmp_path / 'Siphon.exe'))
+    monkeypatch.setattr(tempfile, 'gettempdir', lambda: str(tmp_path))
+    monkeypatch.setenv('_PYI_PARENT_PROCESS_LEVEL', '1')
+    monkeypatch.setenv('_PYI_APPLICATION_HOME_DIR', str(tmp_path / '_MEI999'))
+
+    captured = {}
+
+    def _fake_popen(cmd, **kwargs):
+        captured['cmd'] = cmd
+        captured['kwargs'] = kwargs
+        return object()
+
+    monkeypatch.setattr(subprocess, 'Popen', _fake_popen)
+    assert updater.apply_update_and_restart(str(tmp_path / 'Siphon.exe.new')) is True
+
+    env = captured['kwargs']['env']
+    assert '_PYI_PARENT_PROCESS_LEVEL' not in env
+    assert '_PYI_APPLICATION_HOME_DIR' not in env
+    bat_path = captured['cmd'][2]
+    with open(bat_path, 'r', encoding='utf-8') as fh:
+        bat_text = fh.read()
+    assert 'set "_PYI_PARENT_PROCESS_LEVEL="' in bat_text
+    assert 'set "_PYI_APPLICATION_HOME_DIR="' in bat_text
